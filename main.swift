@@ -5,6 +5,7 @@
 import AppKit
 import WebKit
 import UserNotifications
+import Network
 
 // MARK: - Basics
 
@@ -23,7 +24,7 @@ func nowMs() -> Double { ProcessInfo.processInfo.systemUptime * 1000 }
 let logURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/Streamed.log")
 func log(_ s: String) {
     let f = DateFormatter(); f.dateFormat = "HH:mm:ss.SSS"
-    let line = f.string(from: Date()) + " " + s + "\n"
+    let line = f.string(from: Date()) + " [\(getpid())] " + s + "\n"
     guard let data = line.data(using: .utf8) else { return }
     if let h = try? FileHandle(forWritingTo: logURL) {
         h.seekToEndOfFile(); h.write(data); try? h.close()
@@ -70,6 +71,7 @@ final class PassView: FlippedView { override func hitTest(_ point: NSPoint) -> N
 struct Match {
     let id: String, title: String, category: String, date: Int64, popular: Bool
     let home: String, away: String
+    let raw: [String: Any]
     let sources: [(source: String, id: String)]
     init?(_ d: [String: Any]) {
         id = str(d["id"]); title = str(d["title"]); category = str(d["category"])
@@ -82,6 +84,7 @@ struct Match {
             if parts.count == 2 { h = parts[0]; a = parts[1] }
         }
         home = h; away = a
+        raw = d
         let src = (d["sources"] as? [[String: Any]]) ?? []
         sources = src.map { (source: str($0["source"]), id: str($0["id"])) }.filter { !$0.source.isEmpty && !$0.id.isEmpty }
         if sources.isEmpty || title.isEmpty { return nil }
@@ -370,6 +373,7 @@ if(!ads){var vs=document.querySelectorAll('video');for(var i=0;i<vs.length;i++){
 var m=0;try{m=performance.getEntriesByType('resource').some(function(e){return e.name.indexOf('.m3u8')>=0})?1:0}catch(e){}
 var v=document.querySelector('.jw-media video')||document.querySelector('video');
 if(!v)return JSON.stringify({v:0,bad:bad,ads:ads,m:m});
+try{var be=0;if(v.buffered&&v.buffered.length)be=v.buffered.end(v.buffered.length-1);if(v.seekable&&v.seekable.length)be=Math.max(be,v.seekable.end(v.seekable.length-1));if(be>0&&isFinite(be)){var off=be-performance.now()/1000;if(window.__edge===undefined||off>window.__edge)window.__edge=off}}catch(e){}
 var mute=!!window.__mute;if(v.muted!==mute){v.muted=mute;try{jwplayer().setMute(mute)}catch(e){}}
 if(v.paused&&!window.__userPaused&&!ads){try{jwplayer().play()}catch(e){v.play()}}
 return JSON.stringify({v:1,bad:bad,ads:ads,m:m,t:v.currentTime,p:v.paused,h:v.videoHeight,err:!!v.error});})()
@@ -397,11 +401,279 @@ v.currentTime=t;window.__userPaused=false;try{jwplayer().play()}catch(x){v.play(
 return JSON.stringify({ok:1,behind:Math.max(0,Math.round(e-t)),win:Math.round(e-s),clamped:(t>want+1)?1:0,diag:diag});})()
 """# }
 
+let STATE_JS = #"""
+(function(){var v=document.querySelector('.jw-media video')||document.querySelector('video');if(!v||window.__edge===undefined)return JSON.stringify({});
+var e=window.__edge+performance.now()/1000;return JSON.stringify({behind:Math.max(0,e-v.currentTime),paused:v.paused});})()
+"""#
+
+func seekBehindJS(_ b: Double) -> String { #"""
+(function(){var v=document.querySelector('.jw-media video')||document.querySelector('video');if(!v||window.__edge===undefined)return 'no';
+var e=window.__edge+performance.now()/1000,t=e-(\#(b));var bf=v.buffered;if(bf&&bf.length){var lo=bf.start(0)+0.3,hi=bf.end(bf.length-1)-0.5;t=Math.max(lo,Math.min(hi,t))}
+v.currentTime=t;if(!window.__userPaused){try{jwplayer().play()}catch(x){v.play()}}return 'ok '+t.toFixed(1)})()
+"""# }
+
 let PAUSE_JS = #"""
 (function(){var v=document.querySelector('.jw-media video')||document.querySelector('video');if(!v)return 'none';
 if(v.paused){window.__userPaused=false;try{jwplayer().play()}catch(e){v.play()}return 'play'}
 window.__userPaused=true;try{jwplayer().pause()}catch(e){v.pause()}return 'pause'})()
 """#
+
+// MARK: - Watch party (MQTT 3.1.1 over TLS, public broker, QoS 0)
+
+final class MQTT {
+    let host: String, port: UInt16, clientId: String, topic: String
+    var conn: NWConnection?
+    var buf = Data()
+    var ping: Timer?
+    var closed = false
+    var onMessage: ((Data) -> Void)?
+    var onState: ((Bool) -> Void)?
+    init(host: String, port: UInt16, clientId: String, topic: String) { self.host = host; self.port = port; self.clientId = clientId; self.topic = topic }
+
+    static func str(_ s: String) -> Data { let b = Data(s.utf8); var d = Data([UInt8(b.count >> 8), UInt8(b.count & 255)]); d.append(b); return d }
+    static func packet(_ type: UInt8, _ body: Data) -> Data {
+        var d = Data([type]); var n = body.count
+        repeat { var byte = UInt8(n % 128); n /= 128; if n > 0 { byte |= 128 }; d.append(byte) } while n > 0
+        d.append(body); return d
+    }
+    func start() {
+        closed = false
+        buf = Data()
+        let c = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!, using: .tls)
+        conn = c
+        c.stateUpdateHandler = { [weak self] st in
+            DispatchQueue.main.async {
+                guard let self, self.conn === c else { return }
+                switch st {
+                case .ready:
+                    var b = MQTT.str("MQTT"); b.append(contentsOf: [4, 0x02, 0, 60]); b.append(MQTT.str(self.clientId))
+                    self.send(MQTT.packet(0x10, b))
+                    self.receive()
+                case .failed, .cancelled:
+                    self.conn = nil; self.ping?.invalidate(); self.onState?(false)
+                    if !self.closed { DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in if let s = self, !s.closed, s.conn == nil { s.start() } } }
+                default: break
+                }
+            }
+        }
+        c.start(queue: .main)
+    }
+    func send(_ d: Data) { conn?.send(content: d, completion: .contentProcessed { _ in }) }
+    func publish(_ payload: Data) { var b = MQTT.str(topic); b.append(payload); send(MQTT.packet(0x30, b)) }
+    func receive() {
+        guard let c = conn else { return }
+        c.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, done, err in
+            DispatchQueue.main.async {
+                guard let self, self.conn === c else { return }
+                if let data { self.buf.append(data); self.parse() }
+                if done || err != nil { c.cancel(); return }
+                self.receive()
+            }
+        }
+    }
+    func parse() {
+        while buf.count >= 2 {
+            let bytes = [UInt8](buf)
+            var mult = 1, len = 0, i = 1
+            while true {
+                guard i < bytes.count else { return }
+                let b = Int(bytes[i]); len += (b & 127) * mult; mult *= 128; i += 1
+                if b & 128 == 0 { break }
+                if i > 4 { buf = Data(); return }
+            }
+            guard bytes.count >= i + len else { return }
+            let type = bytes[0] >> 4, qos = (bytes[0] >> 1) & 3
+            let body = [UInt8](bytes[i..<(i + len)])
+            buf = Data(bytes[(i + len)...])
+            if type == 2 {
+                var sub = Data([0, 1]); sub.append(MQTT.str(topic)); sub.append(0)
+                send(MQTT.packet(0x82, sub))
+                ping?.invalidate()
+                ping = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in self?.send(Data([0xC0, 0])) }
+                onState?(true)
+            } else if type == 3, body.count >= 2 {
+                var off = 2 + (Int(body[0]) << 8 | Int(body[1]))
+                if qos > 0 { off += 2 }
+                if body.count >= off { onMessage?(Data(body[off...])) }
+            }
+        }
+    }
+    func stop() { closed = true; ping?.invalidate(); send(Data([0xE0, 0])); let c = conn; conn = nil; DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { c?.cancel() } }
+}
+
+@MainActor final class Party {
+    static let shared = Party()
+    weak var area: PlayerArea?
+    var mqtt: MQTT?
+    var code: String?
+    var isHost = false
+    let me = String(UUID().uuidString.prefix(8)).lowercased()
+    var myName: String {
+        if let n = ProcessInfo.processInfo.environment["STREAMED_NAME"] { return n }
+        return NSFullUserName().split(separator: " ").first.map(String.init) ?? "Freund"
+    }
+    var peerName: String?
+    var peerSeen = 0.0
+    var connected = false
+    var applying = false
+    var lastCorrection = 0.0
+    var lastChat: String?
+    var hb: Timer?
+    var onUI: (() -> Void)?
+    var active: Bool { code != nil }
+
+    static func newCode() -> String {
+        let a = Array("abcdefghjkmnpqrstuvwxyz23456789")
+        return String((0..<4).map { _ in a.randomElement()! }) + "-" + String((0..<4).map { _ in a.randomElement()! })
+    }
+
+    var status: String {
+        guard let code else { return "Mit einem Freund synchron schauen: Pause, Spulen und Stream gelten für beide." }
+        var s = "Code: \(code)  ·  "
+        s += !connected ? "verbinde…" : (peerName.map { "mit \($0) verbunden" } ?? "warte auf deinen Freund…")
+        if let c = lastChat { s += "\n💬 " + c }
+        return s
+    }
+
+    func start(host: Bool, code c: String) {
+        leave(silent: true)
+        let cc = c.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        code = cc; isHost = host; lastChat = nil
+        let m = MQTT(host: "test.mosquitto.org", port: 8886, clientId: "streamed-" + me, topic: "streamed-mac/party/" + cc)
+        m.onState = { [weak self] ok in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.connected = ok
+                log("[party \(self.isHost ? "host" : "guest")] connected=\(ok)")
+                if ok { self.send(["t": "hi"]); if self.isHost { self.sendState(act: true) } }
+                self.onUI?()
+            }
+        }
+        m.onMessage = { [weak self] d in MainActor.assumeIsolated { self?.receive(d) } }
+        mqtt = m
+        m.start()
+        hb?.invalidate()
+        hb = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { _ in MainActor.assumeIsolated { Party.shared.beat() } }
+        log("[party \(host ? "host" : "guest")] start \(cc)")
+        onUI?()
+    }
+
+    func leave(silent: Bool = false) {
+        if mqtt != nil { send(["t": "bye"]) }
+        mqtt?.stop(); mqtt = nil
+        hb?.invalidate(); hb = nil
+        code = nil; peerName = nil; connected = false; lastChat = nil
+        if !silent { onUI?() }
+    }
+
+    func send(_ d: [String: Any]) {
+        guard let mqtt else { return }
+        var m = d
+        m["from"] = me; m["name"] = myName; m["host"] = isHost
+        guard let data = try? JSONSerialization.data(withJSONObject: m) else { return }
+        mqtt.publish(data)
+    }
+
+    func beat() {
+        if let _ = peerName, nowMs() - peerSeen > 15000 { peerName = nil; onUI?() }
+        sendState(act: false)
+    }
+
+    func chat(_ text: String) {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard active, !t.isEmpty else { return }
+        send(["t": "chat", "text": t])
+        lastChat = "Du: " + t
+        area?.active?.toast("💬 Du: " + t)
+        onUI?()
+    }
+
+    /// The local viewer did something (pause, seek, other stream, other game) -> tell the partner.
+    func local(_ t: Tile) {
+        guard active, !applying, t === area?.active else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { MainActor.assumeIsolated { Party.shared.sendState(act: true) } }
+    }
+
+    func sendState(act: Bool) {
+        guard active, connected, let t = area?.active, t.current >= 0, t.current < t.streams.count else { return }
+        let url = t.streams[t.current].url, title = t.streams[t.current].title, started = t.started, paused = t.userPaused, raw = t.match.raw
+        t.web.evaluateJavaScript(STATE_JS) { [weak self] r, _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                var msg: [String: Any] = ["t": "state", "act": act, "match": raw, "url": url, "stitle": title, "started": started, "paused": paused]
+                if let s = r as? String, let o = (try? JSONSerialization.jsonObject(with: Data(s.utf8))) as? [String: Any], let b = o["behind"] { msg["behind"] = b }
+                self.send(msg)
+            }
+        }
+    }
+
+    func receive(_ d: Data) {
+        guard let o = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any], str(o["from"]) != me else { return }
+        let name = str(o["name"]).isEmpty ? "Freund" : str(o["name"])
+        let isNew = peerName == nil
+        peerSeen = nowMs()
+        switch str(o["t"]) {
+        case "bye":
+            area?.active?.toast("👋 \(name) hat die Watch-Party verlassen")
+            peerName = nil; onUI?(); return
+        default: break
+        }
+        peerName = name
+        if isNew { area?.active?.toast("🎉 \(name) ist in der Watch-Party"); onUI?(); log("[party] peer \(name) joined") }
+        switch str(o["t"]) {
+        case "hi": if isHost { sendState(act: true) }
+        case "chat":
+            let txt = str(o["text"])
+            lastChat = "\(name): \(txt)"
+            area?.active?.toast("💬 \(name): \(txt)")
+            if !NSApp.isActive { notifyGoal("💬 \(name)", txt) }
+            onUI?()
+        case "state": apply(o)
+        default: break
+        }
+    }
+
+    func apply(_ o: [String: Any]) {
+        guard let area else { return }
+        let act = (o["act"] as? NSNumber)?.boolValue ?? false
+        let fromHost = (o["host"] as? NSNumber)?.boolValue ?? false
+        if !act && !fromHost { return }   // only the host's heartbeat corrects drift
+        guard let raw = o["match"] as? [String: Any], let m = Match(raw) else { return }
+        let url = str(o["url"]), stitle = str(o["stitle"])
+        applying = true
+        defer { applying = false }
+        if area.active == nil || area.active!.match.id != m.id {
+            log("[party] open \(m.title)")
+            area.add(m, replace: true)
+            area.active?.toast("🎉 Watch-Party: \(m.title)")
+        }
+        guard let t = area.active else { return }
+        if t.current < 0 || t.current >= t.streams.count || t.streams[t.current].url != url {
+            log("[party] stream -> \(stitle)")
+            t.playURL(url, title: stitle)
+            return
+        }
+        guard t.started, (o["started"] as? NSNumber)?.boolValue == true else { return }
+        let paused = (o["paused"] as? NSNumber)?.boolValue ?? false
+        if paused != t.userPaused { t.setPaused(paused) }
+        guard let theirs = (o["behind"] as? NSNumber)?.doubleValue else { return }
+        t.web.evaluateJavaScript(STATE_JS) { [weak self] r, _ in
+            MainActor.assumeIsolated {
+                guard let self, let s = r as? String, let mo = (try? JSONSerialization.jsonObject(with: Data(s.utf8))) as? [String: Any],
+                      let mine = (mo["behind"] as? NSNumber)?.doubleValue else { return }
+                let diff = mine - theirs
+                let now = nowMs()
+                if abs(diff) > (act ? 1.0 : 2.5) && (act || now - self.lastCorrection > 8000) {
+                    self.lastCorrection = now
+                    log("[party] sync: mine \(String(format: "%.1f", mine))s theirs \(String(format: "%.1f", theirs))s -> seek (act=\(act))")
+                    t.seekToBehind(theirs)
+                } else if !act {
+                    log("[party] in sync: diff \(String(format: "%.1f", diff))s")
+                }
+            }
+        }
+    }
+}
 
 // MARK: - Tile (one game)
 
@@ -700,6 +972,29 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
         var r = URLRequest(url: url)
         r.setValue("https://streamed.pk/", forHTTPHeaderField: "Referer")
         web.load(r)
+        Party.shared.local(self)
+    }
+
+    func playURL(_ url: String, title: String) {
+        auto = false
+        if let i = streams.firstIndex(where: { $0.url == url }) { failed[i] = false; play(i, "Watch-Party") }
+        else {
+            streams.append(StreamInfo(url: url, title: title.isEmpty ? "Party-Stream" : title, hd: true))
+            failed.append(false); heights.append(0)
+            play(streams.count - 1, "Watch-Party")
+        }
+    }
+    func setPaused(_ p: Bool) {
+        userPaused = p
+        web.evaluateJavaScript("(function(){var v=document.querySelector('.jw-media video')||document.querySelector('video');if(!v)return;window.__userPaused=\(p);if(\(p)){try{jwplayer().pause()}catch(e){v.pause()}}else{try{jwplayer().play()}catch(e){v.play()}}})()", completionHandler: nil)
+        toast(p ? "⏸ Pause (Watch-Party)" : "▶ Weiter (Watch-Party)")
+    }
+    func seekToBehind(_ b: Double) {
+        web.evaluateJavaScript(seekBehindJS(b)) { [weak self] r, _ in
+            guard let self else { return }
+            self.lastT = -1; self.freezeStart = 0; self.lastProgressAt = nowMs()
+            log("[party] seek result \(String(describing: r))")
+        }
     }
 
     func nextCandidate(from: Int) -> Int {
@@ -848,14 +1143,15 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
             log("[\(self.match.title)] seek \(Int(d))s -> \(behind)s hinter Live (Puffer \(win)s)")
             if clamped == 1 { self.toast("Weiter zurück geht nicht – Stream puffert nur \(win) s\n\(behind) s hinter Live") }
             else { self.toast(behind <= 3 ? "Live" : "\(behind) s hinter Live  ·  → vor · L = Live") }
+            Party.shared.local(self)
         }
     }
-    func goLive() { web.evaluateJavaScript(GO_LIVE, completionHandler: nil); userPaused = false; toast("Live") }
+    func goLive() { web.evaluateJavaScript(GO_LIVE, completionHandler: nil); userPaused = false; toast("Live"); Party.shared.local(self) }
     func togglePause() {
         web.evaluateJavaScript(PAUSE_JS) { [weak self] r, _ in
             guard let self else { return }
             self.userPaused = (r as? String) == "pause"
-            self.toast(self.userPaused ? "Pause" : "Play")
+            self.toast(self.userPaused ? "Pause" : "Play"); Party.shared.local(self)
         }
     }
     func applyAudio() {
@@ -1006,7 +1302,9 @@ final class PlayerArea: FlippedView {
     }
 
     func setActive(_ t: Tile?) {
+        let changed = active !== t
         active = t
+        if changed, let t { Party.shared.local(t) }
         for x in tiles { x.isActive = x === t; x.applyAudio() }
         if focusMode { needsLayout = true }
     }
@@ -1105,6 +1403,31 @@ final class Sidebar: FlippedView, NSTableViewDataSource, NSTableViewDelegate {
     let hint = NSTextField(wrappingLabelWithString: "")
     var onOpen: ((Match, Bool) -> Void)?
     var onForceNew: ((Match) -> Void)?
+    let partyTitle = makeLabel(12, bold: true)
+    let partyStatus = NSTextField(wrappingLabelWithString: "")
+    let partyStart = NSButton(title: "Party starten", target: nil, action: nil)
+    let partyJoin = NSButton(title: "Beitreten…", target: nil, action: nil)
+    let partyCopy = NSButton(title: "Code kopieren", target: nil, action: nil)
+    let partyLeave = NSButton(title: "Verlassen", target: nil, action: nil)
+    let chatField = NSTextField()
+    let emojiBtns: [NSButton] = ["⚽", "😂", "😡", "🔥", "👀"].map { NSButton(title: $0, target: nil, action: nil) }
+    var onPartyStart: (() -> Void)?, onPartyJoin: (() -> Void)?, onPartyLeave: (() -> Void)?, onPartyCopy: (() -> Void)?
+    @objc func pStart() { onPartyStart?() }
+    @objc func pJoin() { onPartyJoin?() }
+    @objc func pLeave() { onPartyLeave?() }
+    @objc func pCopy() { onPartyCopy?() }
+    @objc func pChat() { Party.shared.chat(chatField.stringValue); chatField.stringValue = "" }
+    @objc func pEmoji(_ b: NSButton) { Party.shared.chat(b.title) }
+    func updateParty() {
+        let on = Party.shared.active
+        partyTitle.stringValue = on ? "🎉 WATCH-PARTY" : "WATCH-PARTY"
+        partyTitle.textColor = on ? C_ACCENT : C_MUTED
+        partyStatus.stringValue = Party.shared.status
+        for v in [partyStart, partyJoin] as [NSView] { v.isHidden = on }
+        for v in [partyCopy, partyLeave, chatField] as [NSView] { v.isHidden = !on }
+        emojiBtns.forEach { $0.isHidden = !on }
+        needsLayout = true
+    }
     var onMulti: ((Bool) -> Void)?
     let multiBtn = NSButton(title: "▦ Multistream", target: nil, action: nil)
     func setMulti(_ on: Bool) {
@@ -1152,12 +1475,25 @@ final class Sidebar: FlippedView, NSTableViewDataSource, NSTableViewDelegate {
         hint.stringValue = "Doppelklick / ↩ = neue Kachel  ·  ⌥ = aktive ersetzen\nKlick auf Kachel = Ton  ·  Doppelklick / F = Vollbild\n1–6 Kachel · G Raster/Fokus · S Liste · Esc raus\n←→ Stream · A Auto · M Ton · L Live · R Reload · ␣ Pause"
         hint.font = .systemFont(ofSize: 10.5)
         hint.textColor = C_MUTED
+        partyStatus.font = .systemFont(ofSize: 11)
+        partyStatus.textColor = C_TEXT
+        partyStatus.maximumNumberOfLines = 3
+        for (b, sel) in [(partyStart, #selector(pStart)), (partyJoin, #selector(pJoin)), (partyCopy, #selector(pCopy)), (partyLeave, #selector(pLeave))] {
+            b.bezelStyle = .rounded; b.controlSize = .small; b.font = .systemFont(ofSize: 11); b.target = self; b.action = sel
+        }
+        chatField.placeholderString = "Nachricht an die Party… (↩)"
+        chatField.font = .systemFont(ofSize: 12)
+        chatField.target = self
+        chatField.action = #selector(pChat)
+        for b in emojiBtns { b.bezelStyle = .rounded; b.font = .systemFont(ofSize: 15); b.target = self; b.action = #selector(pEmoji(_:)) }
         multiBtn.setButtonType(.pushOnPushOff)
         multiBtn.bezelStyle = .rounded
         multiBtn.target = self
         multiBtn.action = #selector(multiTapped)
         multiBtn.toolTip = "Mehrere Spiele gleichzeitig anzeigen"
-        for v in [logo, multiBtn, tabs, search, header, scroll, hint] as [NSView] { addSubview(v) }
+        for v in [logo, multiBtn, tabs, search, header, scroll, hint, partyTitle, partyStatus, partyStart, partyJoin, partyCopy, partyLeave, chatField] as [NSView] { addSubview(v) }
+        emojiBtns.forEach { addSubview($0) }
+        updateParty()
     }
     required init?(coder: NSCoder) { fatalError() }
 
@@ -1172,7 +1508,19 @@ final class Sidebar: FlippedView, NSTableViewDataSource, NSTableViewDelegate {
         search.frame = NSRect(x: P, y: 78, width: W - 2 * P, height: 24)
         header.frame = NSRect(x: P, y: 108, width: W - 2 * P, height: 15)
         let hintH: CGFloat = 62
-        scroll.frame = NSRect(x: 6, y: 128, width: W - 12, height: max(0, H - 128 - hintH - 10))
+        let on = Party.shared.active
+        let partyH: CGFloat = on ? 150 : 84
+        let py = H - hintH - 12 - partyH
+        partyTitle.frame = NSRect(x: P, y: py, width: W - 2 * P, height: 16)
+        partyStatus.frame = NSRect(x: P, y: py + 18, width: W - 2 * P, height: on ? 44 : 30)
+        let by = py + (on ? 64 : 52)
+        partyStart.frame = NSRect(x: P - 4, y: by, width: 120, height: 24)
+        partyJoin.frame = NSRect(x: P + 120, y: by, width: 110, height: 24)
+        partyCopy.frame = NSRect(x: P - 4, y: by, width: 120, height: 24)
+        partyLeave.frame = NSRect(x: P + 120, y: by, width: 100, height: 24)
+        chatField.frame = NSRect(x: P, y: by + 30, width: W - 2 * P, height: 22)
+        for (i, b) in emojiBtns.enumerated() { b.frame = NSRect(x: P - 4 + CGFloat(i) * 44, y: by + 56, width: 42, height: 26) }
+        scroll.frame = NSRect(x: 6, y: 128, width: W - 12, height: max(0, py - 128 - 8))
         hint.frame = NSRect(x: P, y: H - hintH - 6, width: W - 2 * P, height: hintH)
         table.tableColumns.first?.width = max(50, scroll.contentSize.width - 2)
     }
@@ -1340,6 +1688,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { ok, err in log("notifications allowed: \(ok) \(String(describing: err))") }
         Scores.shared.start()
+        Party.shared.area = root.area
+        Party.shared.onUI = { [weak self] in self?.root.sidebar.updateParty() }
+        root.sidebar.onPartyStart = { [weak self] in self?.partyStart() }
+        root.sidebar.onPartyJoin = { [weak self] in self?.partyJoin() }
+        root.sidebar.onPartyLeave = { Party.shared.leave() }
+        root.sidebar.onPartyCopy = { [weak self] in if let c = Party.shared.code { self?.copyCode(c) } }
+        if let i = ProcessInfo.processInfo.arguments.firstIndex(of: "--party-host"), i + 1 < ProcessInfo.processInfo.arguments.count { Party.shared.start(host: true, code: ProcessInfo.processInfo.arguments[i + 1]) }
+        if let i = ProcessInfo.processInfo.arguments.firstIndex(of: "--party-join"), i + 1 < ProcessInfo.processInfo.arguments.count { Party.shared.start(host: false, code: ProcessInfo.processInfo.arguments[i + 1]) }
         let args = ProcessInfo.processInfo.arguments
         if args.contains("--goaltest") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
@@ -1356,6 +1712,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         root.area.active?.toast(on ? "Multistream an – neue Spiele kommen als eigene Kachel dazu" : "Multistream aus")
     }
     @objc func toggleMulti() { setMulti(!root.area.multi) }
+    func copyCode(_ c: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(c, forType: .string)
+        root.area.active?.toast("Party-Code \(c) kopiert")
+    }
+    @objc func partyStart() {
+        let c = Party.newCode()
+        Party.shared.start(host: true, code: c)
+        copyCode(c)
+        let a = NSAlert()
+        a.messageText = "Watch-Party gestartet"
+        a.informativeText = "Schick deinem Freund diesen Code (ist schon kopiert):\n\n\(c)\n\nEr klickt in Streamed auf „Beitreten…“ und gibt ihn ein. Danach gelten Spiel, Stream, Pause und Spulen für euch beide."
+        a.addButton(withTitle: "OK")
+        a.runModal()
+    }
+    @objc func partyJoin() {
+        let a = NSAlert()
+        a.messageText = "Watch-Party beitreten"
+        a.informativeText = "Code von deinem Freund eingeben (z.B. kx7m-3pqa):"
+        let f = NSTextField(frame: NSRect(x: 0, y: 0, width: 220, height: 24))
+        a.accessoryView = f
+        a.addButton(withTitle: "Beitreten")
+        a.addButton(withTitle: "Abbrechen")
+        a.window.initialFirstResponder = f
+        if a.runModal() == .alertFirstButtonReturn {
+            let c = f.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !c.isEmpty { Party.shared.start(host: false, code: c) }
+        }
+    }
     var spoilerMenu: NSMenu?
     func updateSpoilerMenu() { spoilerMenu?.items.forEach { $0.state = Double($0.tag) == Scores.shared.delay ? .on : .off } }
     @objc func setSpoiler(_ i: NSMenuItem) {
