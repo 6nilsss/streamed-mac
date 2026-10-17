@@ -604,8 +604,7 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
 
     func updateChrome() {
         let multi = (area?.tiles.count ?? 1) > 1
-        var t = match.title
-        if let sc = Scores.shared.score(match) { t = "\(match.home) \(sc.h):\(sc.a) \(match.away)  ·  \(sc.clock)" }
+        let t = match.title
         titleL.stringValue = (isActive && multi && !(area?.muteAll ?? false) ? "🔊 " : "") + t
         var parts = [auto ? "AUTO" : "MANUELL"]
         if current >= 0 && current < streams.count {
@@ -1087,7 +1086,7 @@ final class MatchCell: NSTableCellView {
         let time = f.string(from: Date(timeIntervalSince1970: Double(m.date) / 1000))
         r.stringValue = m.is247 ? "24/7" : (m.isLive ? "LIVE · " + time : time)
         r.textColor = m.isLive && !m.is247 ? C_ACCENT : C_MUTED
-        if let sc = Scores.shared.score(m) {
+        if !open, let sc = Scores.shared.score(m) {
             r.stringValue = "\(sc.h):\(sc.a) · \(sc.clock)"
             r.textColor = sc.state == "in" ? C_ACCENT : C_MUTED
         }
@@ -1335,9 +1334,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         Scores.shared.onGoal = { [weak self] mid, head, detail in
             guard let self else { return }
             log("goal: \(head) \(detail)")
-            let open = self.root.area.tiles.filter { $0.match.id == mid }
-            open.forEach { $0.goal(head, detail) }
-            if !open.isEmpty && !NSApp.isActive { notifyGoal(head, detail) }
+            if self.root.area.tiles.contains(where: { $0.match.id == mid }) { return }   // no spoilers for games you watch
+            self.root.area.active?.toast("⚽ " + head + "\n" + detail)
+            if !NSApp.isActive { notifyGoal(head, detail) }
         }
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { ok, err in log("notifications allowed: \(ok) \(String(describing: err))") }
         Scores.shared.start()
