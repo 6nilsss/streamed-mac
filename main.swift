@@ -4,6 +4,7 @@
 
 import AppKit
 import WebKit
+import UserNotifications
 
 // MARK: - Basics
 
@@ -68,11 +69,19 @@ final class PassView: FlippedView { override func hitTest(_ point: NSPoint) -> N
 
 struct Match {
     let id: String, title: String, category: String, date: Int64, popular: Bool
+    let home: String, away: String
     let sources: [(source: String, id: String)]
     init?(_ d: [String: Any]) {
         id = str(d["id"]); title = str(d["title"]); category = str(d["category"])
         date = (d["date"] as? NSNumber)?.int64Value ?? 0
         popular = (d["popular"] as? NSNumber)?.boolValue ?? false
+        let teams = d["teams"] as? [String: Any]
+        var h = str((teams?["home"] as? [String: Any])?["name"]), a = str((teams?["away"] as? [String: Any])?["name"])
+        if h.isEmpty || a.isEmpty {
+            let parts = str(d["title"]).components(separatedBy: " vs ")
+            if parts.count == 2 { h = parts[0]; a = parts[1] }
+        }
+        home = h; away = a
         let src = (d["sources"] as? [[String: Any]]) ?? []
         sources = src.map { (source: str($0["source"]), id: str($0["id"])) }.filter { !$0.source.isEmpty && !$0.id.isEmpty }
         if sources.isEmpty || title.isEmpty { return nil }
@@ -118,6 +127,168 @@ func fetchStreams(_ m: Match) async -> [StreamInfo] {
         if a.hd != b.hd { return a.hd }
         if lang(a) != lang(b) { return lang(a) < lang(b) }
         return a.title < b.title
+    }
+}
+
+// MARK: - Live scores (ESPN public scoreboard) + goal alerts
+
+struct Score: Equatable { var h: Int; var a: Int; var clock: String; var state: String }
+
+let ESPN_LEAGUES = ["ger.1", "ger.2", "aut.1", "eng.1", "eng.2", "esp.1", "ita.1", "fra.1", "ned.1", "por.1", "sco.1", "tur.1", "bel.1",
+                    "uefa.champions", "uefa.europa", "uefa.europa.conf", "uefa.nations", "fifa.world", "fifa.worldq.uefa", "usa.1", "ger.dfb_pokal", "eng.fa", "esp.copa_del_rey", "ita.coppa_italia"]
+let WEAK_TOKENS: Set<String> = ["real", "city", "united", "borussia", "sporting", "atletico", "athletic", "olympique", "saint", "inter", "racing", "dynamo", "union", "town", "rovers", "wanderers", "hotspur", "albion"]
+let STOP_TOKENS: Set<String> = ["fc", "sc", "sv", "cf", "ac", "afc", "club", "the", "fk", "vfb", "vfl", "tsg", "bsc", "ssc", "rcd", "cd", "ud", "sd", "de", "of", "and", "calcio", "1899", "1900", "1909", "1846", "1904", "1910"]
+
+func nameTokens(_ s: String) -> Set<String> {
+    let f = s.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: nil).lowercased()
+    let parts = f.unicodeScalars.map { CharacterSet.alphanumerics.contains($0) ? Character($0) : " " }
+    return Set(String(parts).split(separator: " ").map(String.init).filter { $0.count >= 3 && !STOP_TOKENS.contains($0) && Int($0) == nil })
+}
+func sideScore(_ a: Set<String>, _ b: Set<String>) -> Double {
+    var sc = 0.0
+    for x in a {
+        if b.contains(x) || b.contains(where: { ($0.count >= 5 && x.count >= 5) && ($0.hasPrefix(x) || x.hasPrefix($0)) }) {
+            sc += WEAK_TOKENS.contains(x) ? 0.4 : 1
+        }
+    }
+    return sc
+}
+
+func fetchURL(_ u: String) async -> Any? {
+    guard let url = URL(string: u) else { return nil }
+    var r = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 10)
+    r.setValue(UA, forHTTPHeaderField: "User-Agent")
+    guard let (d, _) = try? await URLSession.shared.data(for: r) else { return nil }
+    return try? JSONSerialization.jsonObject(with: d)
+}
+
+struct EspnEvent { let id: String; let home: Set<String>; let away: Set<String>; let score: Score }
+
+@MainActor final class Scores {
+    static let shared = Scores()
+    var delay: Double = (UD.object(forKey: "spoilerDelay") as? NSNumber)?.doubleValue ?? 45
+    var events: [String: EspnEvent] = [:]
+    var hist: [String: [(Double, Score)]] = [:]
+    var shown: [String: Score] = [:]
+    var matches: [String: Match] = [:]
+    var map: [String: (String, Bool)] = [:]   // streamed id -> (espn id, swapped)
+    var onChange: (() -> Void)?
+    var onGoal: ((String, String, String) -> Void)?   // streamed id, headline, detail
+    var started = false
+
+    func start() {
+        guard !started else { return }
+        started = true
+        fetch()
+        Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { _ in MainActor.assumeIsolated { Scores.shared.fetch() } }
+        Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { _ in MainActor.assumeIsolated { Scores.shared.tick() } }
+    }
+
+    func setDelay(_ d: Double) { delay = d; UD.set(d, forKey: "spoilerDelay"); tick() }
+
+    func register(_ ms: [Match]) {
+        var added = false
+        for m in ms where m.category == "football" && !m.home.isEmpty {
+            if matches[m.id] == nil { added = true }
+            matches[m.id] = m
+        }
+        if added { remap() }
+    }
+
+    func fetch() {
+        Task { @MainActor in
+            let lists = await withTaskGroup(of: [EspnEvent].self) { g -> [EspnEvent] in
+                for l in ESPN_LEAGUES {
+                    g.addTask {
+                        guard let d = await fetchURL("https://site.api.espn.com/apis/site/v2/sports/soccer/\(l)/scoreboard") as? [String: Any],
+                              let evs = d["events"] as? [[String: Any]] else { return [] }
+                        return evs.compactMap { e -> EspnEvent? in
+                            guard let comp = (e["competitions"] as? [[String: Any]])?.first,
+                                  let cs = comp["competitors"] as? [[String: Any]], cs.count == 2,
+                                  let st = e["status"] as? [String: Any], let ty = st["type"] as? [String: Any] else { return nil }
+                            var hT = Set<String>(), aT = Set<String>(), hS = 0, aS = 0
+                            for c in cs {
+                                let t = c["team"] as? [String: Any] ?? [:]
+                                var tk = Set<String>()
+                                for k in ["displayName", "shortDisplayName", "location", "name"] { tk.formUnion(nameTokens(str(t[k]))) }
+                                let sc = Int(str(c["score"])) ?? 0
+                                if str(c["homeAway"]) == "home" { hT = tk; hS = sc } else { aT = tk; aS = sc }
+                            }
+                            let state = str(ty["state"])
+                            var clock = str(ty["shortDetail"])
+                            if state == "post" { clock = "Ende" } else if clock == "HT" || clock == "Halftime" { clock = "Pause" }
+                            return EspnEvent(id: str(e["id"]), home: hT, away: aT, score: Score(h: hS, a: aS, clock: clock, state: state))
+                        }
+                    }
+                }
+                var out: [EspnEvent] = []
+                for await x in g { out += x }
+                return out
+            }
+            if lists.isEmpty { return }
+            let now = nowMs() / 1000
+            for e in lists where e.score.state != "pre" {
+                events[e.id] = e
+                var h = hist[e.id] ?? []
+                if h.last?.1 != e.score { h.append((now, e.score)) }
+                if h.count > 40 { h.removeFirst(h.count - 40) }
+                hist[e.id] = h
+            }
+            remap()
+            tick()
+        }
+    }
+
+    func remap() {
+        for (id, m) in matches where map[id] == nil {
+            let mh = nameTokens(m.home), ma = nameTokens(m.away)
+            var best: (String, Bool, Double)?
+            for e in events.values {
+                let s1 = (sideScore(mh, e.home), sideScore(ma, e.away))
+                let s2 = (sideScore(mh, e.away), sideScore(ma, e.home))
+                if s1.0 >= 1 && s1.1 >= 1, s1.0 + s1.1 > (best?.2 ?? 0) { best = (e.id, false, s1.0 + s1.1) }
+                if s2.0 >= 1 && s2.1 >= 1, s2.0 + s2.1 > (best?.2 ?? 0) { best = (e.id, true, s2.0 + s2.1) }
+            }
+            if let b = best { map[id] = (b.0, b.1); log("score match: \(m.title) -> espn \(b.0)\(b.1 ? " (swapped)" : "")") }
+        }
+    }
+
+    func tick() {
+        let now = nowMs() / 1000
+        var changed = false
+        for (eid, h) in hist {
+            guard let first = h.first else { continue }
+            let cur = h.last(where: { $0.0 <= now - delay })?.1 ?? (shown[eid] == nil ? first.1 : nil)
+            guard let cur, cur != shown[eid] else { continue }
+            let old = shown[eid]
+            shown[eid] = cur
+            changed = true
+            if let old, cur.h + cur.a > old.h + old.a {
+                for (mid, (e2, sw)) in map where e2 == eid {
+                    guard let m = matches[mid] else { continue }
+                    let homeScored = cur.h > old.h
+                    let scorer = (homeScored != sw) ? m.home : m.away
+                    let (l, r) = sw ? (cur.a, cur.h) : (cur.h, cur.a)
+                    onGoal?(mid, "TOR! \(scorer)", "\(m.home) \(l):\(r) \(m.away)  ·  \(cur.clock)")
+                }
+            }
+        }
+        if changed { onChange?() }
+    }
+
+    /// Score in the streamed match's own home/away orientation.
+    func score(_ m: Match) -> Score? {
+        guard let (eid, sw) = map[m.id], var s = shown[eid] else { return nil }
+        if sw { s = Score(h: s.a, a: s.h, clock: s.clock, state: s.state) }
+        return s
+    }
+}
+
+func notifyGoal(_ title: String, _ body: String) {
+    let c = UNMutableNotificationContent()
+    c.title = title; c.body = body; c.sound = .default
+    UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil)) { err in
+        if let err { log("notify error: \(err)") }
     }
 }
 
@@ -262,6 +433,9 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
     let toastBox = PassView()
     let toastL = NSTextField(wrappingLabelWithString: "")
     let border = PassView()
+    let goalBox = PassView()
+    let goalL = NSTextField(wrappingLabelWithString: "")
+    var goalTask: Task<Void, Never>?
     var barTask: Task<Void, Never>?
     var toastTask: Task<Void, Never>?
 
@@ -307,6 +481,15 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
         toastBox.isHidden = true
         addSubview(toastBox)
 
+        goalBox.wantsLayer = true
+        goalBox.layer?.backgroundColor = C_ACCENT.withAlphaComponent(0.92).cgColor
+        goalBox.layer?.cornerRadius = 14
+        goalL.alignment = .center
+        goalL.textColor = .white
+        goalL.maximumNumberOfLines = 3
+        goalBox.addSubview(goalL)
+        goalBox.isHidden = true
+        addSubview(goalBox)
         border.wantsLayer = true
         border.layer?.borderColor = C_ACCENT.cgColor
         border.layer?.borderWidth = 0
@@ -359,6 +542,29 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
         toastBox.frame = NSRect(x: 12, y: h - s.height - 30, width: s.width + 20, height: s.height + 14)
         toastL.frame = NSRect(x: 10, y: 7, width: s.width, height: s.height)
         border.frame = bounds
+        let gw = min(w - 40, 520), big: CGFloat = w < 500 ? 26 : 38
+        goalL.font = .systemFont(ofSize: big, weight: .heavy)
+        goalL.preferredMaxLayoutWidth = gw - 32
+        let gs = goalL.intrinsicContentSize
+        goalBox.frame = NSRect(x: (w - gw) / 2, y: (h - gs.height - 36) / 2, width: gw, height: ceil(gs.height) + 36)
+        goalL.frame = NSRect(x: 16, y: 18, width: gw - 32, height: ceil(gs.height))
+    }
+
+    func goal(_ head: String, _ detail: String) {
+        let a = NSMutableAttributedString(string: "⚽ " + head + "\n", attributes: [.font: NSFont.systemFont(ofSize: bounds.width < 500 ? 24 : 36, weight: .heavy), .foregroundColor: NSColor.white])
+        a.append(NSAttributedString(string: detail, attributes: [.font: NSFont.systemFont(ofSize: bounds.width < 500 ? 13 : 17, weight: .semibold), .foregroundColor: NSColor.white]))
+        let p = NSMutableParagraphStyle(); p.alignment = .center
+        a.addAttribute(.paragraphStyle, value: p, range: NSRange(location: 0, length: a.length))
+        goalL.attributedStringValue = a
+        goalBox.isHidden = false
+        goalBox.alphaValue = 1
+        needsLayout = true
+        goalTask?.cancel()
+        goalTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 7_000_000_000)
+            guard let self, !Task.isCancelled else { return }
+            self.goalBox.isHidden = true
+        }
     }
 
     // hover bar
@@ -398,7 +604,9 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
 
     func updateChrome() {
         let multi = (area?.tiles.count ?? 1) > 1
-        titleL.stringValue = (isActive && multi && !(area?.muteAll ?? false) ? "🔊 " : "") + match.title
+        var t = match.title
+        if let sc = Scores.shared.score(match) { t = "\(match.home) \(sc.h):\(sc.a) \(match.away)  ·  \(sc.clock)" }
+        titleL.stringValue = (isActive && multi && !(area?.muteAll ?? false) ? "🔊 " : "") + t
         var parts = [auto ? "AUTO" : "MANUELL"]
         if current >= 0 && current < streams.count {
             parts.append(streams[current].title)
@@ -415,6 +623,7 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
 
     func open(_ m: Match) {
         match = m
+        Scores.shared.register([m])
         listReady = false; auto = true; current = -1; deadUrl = nil
         streams = []; failed = []; heights = []
         openToken += 1
@@ -878,6 +1087,10 @@ final class MatchCell: NSTableCellView {
         let time = f.string(from: Date(timeIntervalSince1970: Double(m.date) / 1000))
         r.stringValue = m.is247 ? "24/7" : (m.isLive ? "LIVE · " + time : time)
         r.textColor = m.isLive && !m.is247 ? C_ACCENT : C_MUTED
+        if let sc = Scores.shared.score(m) {
+            r.stringValue = "\(sc.h):\(sc.a) · \(sc.clock)"
+            r.textColor = sc.state == "in" ? C_ACCENT : C_MUTED
+        }
         needsLayout = true
     }
 }
@@ -991,6 +1204,7 @@ final class Sidebar: FlippedView, NSTableViewDataSource, NSTableViewDelegate {
                 return a.date < b.date
             }
             self.all = ms
+            Scores.shared.register(ms)
             self.applyFilter()
         }
     }
@@ -1113,7 +1327,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             MainActor.assumeIsolated { self?.root.sidebar.load() }
         })
         installMonitors()
+        Scores.shared.onChange = { [weak self] in
+            guard let self else { return }
+            self.root.sidebar.refreshMarks()
+            self.root.area.tiles.forEach { $0.updateChrome() }
+        }
+        Scores.shared.onGoal = { [weak self] mid, head, detail in
+            guard let self else { return }
+            log("goal: \(head) \(detail)")
+            let open = self.root.area.tiles.filter { $0.match.id == mid }
+            open.forEach { $0.goal(head, detail) }
+            if !open.isEmpty && !NSApp.isActive { notifyGoal(head, detail) }
+        }
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { ok, err in log("notifications allowed: \(ok) \(String(describing: err))") }
+        Scores.shared.start()
         let args = ProcessInfo.processInfo.arguments
+        if args.contains("--goaltest") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
+                guard let self, let t = self.root.area.tiles.first else { return }
+                Scores.shared.onGoal?(t.match.id, "TOR! \(t.match.home)", "\(t.match.home) 1:0 \(t.match.away)  ·  Test")
+            }
+        }
         if let i = args.firstIndex(of: "--open"), i + 1 < args.count, let n = Int(args[i + 1]) { autoOpen(n) }
     }
 
@@ -1123,6 +1357,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         root.area.active?.toast(on ? "Multistream an – neue Spiele kommen als eigene Kachel dazu" : "Multistream aus")
     }
     @objc func toggleMulti() { setMulti(!root.area.multi) }
+    var spoilerMenu: NSMenu?
+    func updateSpoilerMenu() { spoilerMenu?.items.forEach { $0.state = Double($0.tag) == Scores.shared.delay ? .on : .off } }
+    @objc func setSpoiler(_ i: NSMenuItem) {
+        Scores.shared.setDelay(Double(i.tag)); updateSpoilerMenu()
+        root.area.active?.toast(i.tag == 0 ? "Spoiler-Schutz aus" : "Spielstand und Tore kommen \(i.tag) s verzögert")
+    }
 
     func autoOpen(_ n: Int) {
         if n > 1 { setMulti(true) }
@@ -1284,6 +1524,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         item("Spielliste ein/aus", #selector(toggleSidebar), "s", [.command, .control]),
                         item("Ton aus/an", #selector(toggleMute), "m", [.command, .shift]),
                         item("Vollbild", #selector(NSWindow.toggleFullScreen(_:)), "f", [.command, .control])])
+        let spoil = NSMenuItem(title: "Spoiler-Schutz (Spielstand verzögern)", action: nil, keyEquivalent: "")
+        let sm = NSMenu(title: "Spoiler-Schutz")
+        for d in [0, 30, 45, 60, 90, 120] {
+            let it = NSMenuItem(title: d == 0 ? "Aus (sofort)" : "\(d) Sekunden", action: #selector(setSpoiler(_:)), keyEquivalent: "")
+            it.target = self; it.tag = d
+            sm.addItem(it)
+        }
+        spoil.submenu = sm
+        main.items.first(where: { $0.submenu?.title == "Ansicht" })?.submenu?.addItem(.separator())
+        main.items.first(where: { $0.submenu?.title == "Ansicht" })?.submenu?.addItem(spoil)
+        spoilerMenu = sm
+        updateSpoilerMenu()
         sub("Fenster", [item("Minimieren", #selector(NSWindow.performMiniaturize(_:)), "m")])
         NSApp.mainMenu = main
     }

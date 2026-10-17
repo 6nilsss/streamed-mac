@@ -24,6 +24,7 @@ Rechts unter **Releases** die Datei `Streamed.zip` laden.
 | ← → | 10 s zurück / vor, L = Live |
 | [ ] | anderen Stream, A = Automatisch |
 | G | Raster oder Fokus-Ansicht |
+| Spielstand + Tor-Alarm | automatisch, mit Spoiler-Schutz (Ansicht → Spoiler-Schutz, Standard 45 s) |
 
 ## Selbst bauen
 
