@@ -31,7 +31,7 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
   <key>CFBundleExecutable</key><string>Streamed</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>CFBundleShortVersionString</key><string>__VERSION__</string>
   <key>CFBundleVersion</key><string>1</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.sports</string>
@@ -41,6 +41,7 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
 </dict></plist>
 EOF
 
+sed -i '' "s/__VERSION__/$(cat VERSION 2>/dev/null || echo 1.0)/" "$APP/Contents/Info.plist"
 codesign --force --deep -s - "$APP" >/dev/null 2>&1
 mkdir -p ~/Applications
 rm -rf ~/Applications/Streamed.app

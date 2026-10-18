@@ -26,6 +26,10 @@ Rechts unter **Releases** die Datei `Streamed.zip` laden.
 | G | Raster oder Fokus-Ansicht |
 | Spielstand + Tor-Alarm | nur für Spiele, die du gerade NICHT schaust (keine Spoiler), mit Spoiler-Schutz (Ansicht → Spoiler-Schutz, Standard 45 s) |
 
+## Automatische Updates
+
+Ab Version 1.5 schaut Streamed bei jedem Start auf GitHub nach einer neuen Version, lädt sie und startet neu. Läuft gerade ein Spiel, wird erst beim Beenden installiert. Die App muss dafür im Programme-Ordner liegen.
+
 ## Watch-Party
 
 Mit einem Freund synchron schauen: Links unten **Party starten**, den Code schicken. Der Freund klickt **Beitreten…** und gibt den Code ein. Spiel, Stream, Pause und Spulen gelten dann für beide, dazu Chat und Emoji-Reaktionen. Läuft über den öffentlichen Test-Server test.mosquitto.org (ohne Anmeldung).

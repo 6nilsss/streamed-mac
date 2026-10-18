@@ -295,6 +295,106 @@ func notifyGoal(_ title: String, _ body: String) {
     }
 }
 
+// MARK: - Auto update from GitHub releases
+
+let UPDATE_API = "https://api.github.com/repos/6nilsss/streamed-mac/releases/latest"
+
+@MainActor final class Updater {
+    static let shared = Updater()
+    var pendingScript: String?
+    var busy = false
+    var onStatus: ((String) -> Void)?
+
+    var current: String {
+        let a = ProcessInfo.processInfo.arguments
+        if let i = a.firstIndex(of: "--fake-version"), i + 1 < a.count { return a[i + 1] }
+        return Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
+    }
+
+    static func newer(_ a: String, than b: String) -> Bool {
+        let x = a.split(separator: ".").map { Int($0) ?? 0 }, y = b.split(separator: ".").map { Int($0) ?? 0 }
+        for i in 0..<max(x.count, y.count) {
+            let p = i < x.count ? x[i] : 0, q = i < y.count ? y[i] : 0
+            if p != q { return p > q }
+        }
+        return false
+    }
+
+    func check(manual: Bool, canRestartNow: @escaping () -> Bool) {
+        guard !busy, pendingScript == nil else { if manual, pendingScript != nil { onStatus?("Update ist schon bereit und wird beim Beenden installiert") }; return }
+        busy = true
+        Task { @MainActor in
+            defer { self.busy = false }
+            guard let d = await fetchURL(UPDATE_API) as? [String: Any] else {
+                if manual { onStatus?("Update-Check fehlgeschlagen – kein Internet?") }
+                return
+            }
+            let tag = str(d["tag_name"]).trimmingCharacters(in: CharacterSet(charactersIn: "vV"))
+            log("[update] installed \(current), latest \(tag)")
+            guard Updater.newer(tag, than: current) else { if manual { onStatus?("Streamed ist aktuell (\(current))") }; return }
+            let assets = d["assets"] as? [[String: Any]] ?? []
+            guard let a = assets.first(where: { str($0["name"]).hasSuffix(".zip") }), let url = URL(string: str(a["browser_download_url"])) else { return }
+            let appPath = Bundle.main.bundlePath
+            let parent = (appPath as NSString).deletingLastPathComponent
+            if appPath.contains("/AppTranslocation/") || !FileManager.default.isWritableFile(atPath: parent) {
+                onStatus?("Update \(tag) verfügbar – zieh Streamed in den Programme-Ordner, dann installiert es sich automatisch")
+                return
+            }
+            onStatus?("Lade Update \(tag)…")
+            guard let (tmp, resp) = try? await URLSession.shared.download(from: url), (resp as? HTTPURLResponse)?.statusCode == 200 else {
+                onStatus?("Update-Download fehlgeschlagen"); return
+            }
+            let fm = FileManager.default
+            let dir = fm.temporaryDirectory.appendingPathComponent("streamed-update-\(tag)-\(getpid())")
+            try? fm.removeItem(at: dir)
+            try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            let zip = dir.appendingPathComponent("Streamed.zip")
+            try? fm.moveItem(at: tmp, to: zip)
+            let unz = Process()
+            unz.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+            unz.arguments = ["-x", "-k", zip.path, dir.path]
+            try? unz.run(); unz.waitUntilExit()
+            let newApp = dir.appendingPathComponent("Streamed.app")
+            guard let b = Bundle(path: newApp.path), b.bundleIdentifier == Bundle.main.bundleIdentifier ?? "at.nils.streamed" else {
+                onStatus?("Update-Paket ungültig – übersprungen"); return
+            }
+            let script = dir.appendingPathComponent("install.sh")
+            let sh = """
+            #!/bin/sh
+            while kill -0 \(getpid()) 2>/dev/null; do sleep 0.2; done
+            OLD='\(appPath)'
+            NEW='\(newApp.path)'
+            rm -rf "$OLD.old"
+            if mv "$OLD" "$OLD.old" && mv "$NEW" "$OLD"; then rm -rf "$OLD.old"; else [ -d "$OLD.old" ] && [ ! -d "$OLD" ] && mv "$OLD.old" "$OLD"; fi
+            xattr -dr com.apple.quarantine "$OLD" 2>/dev/null
+            if [ "$1" = "relaunch" ]; then open "$OLD"; fi
+            """
+            do { try sh.write(to: script, atomically: true, encoding: .utf8) } catch { onStatus?("Update konnte nicht vorbereitet werden"); return }
+            try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+            pendingScript = script.path
+            log("[update] \(tag) downloaded, ready to install")
+            if canRestartNow() {
+                onStatus?("Update \(tag) wird installiert – Streamed startet gleich neu…")
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                runPending(relaunch: true)
+                NSApp.terminate(nil)
+            } else {
+                onStatus?("Update \(tag) ist bereit und wird beim Beenden installiert")
+            }
+        }
+    }
+
+    func runPending(relaunch: Bool) {
+        guard let s = pendingScript else { return }
+        pendingScript = nil
+        log("[update] installing (relaunch=\(relaunch))")
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/sh")
+        p.arguments = [s] + (relaunch ? ["relaunch"] : [])
+        try? p.run()
+    }
+}
+
 // MARK: - Ad blocking (WebKit content rules, same lists as on the TV)
 
 let ALLOW = ["embed.st", "strmd.st", "strmd.b-cdn.net", "tiktokcdn.com", "jsdelivr.net", "streamed.pk"]
@@ -1779,6 +1879,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    func applicationWillTerminate(_ notification: Notification) { Updater.shared.runPending(relaunch: false) }
+    @objc func checkUpdates() { Updater.shared.check(manual: true, canRestartNow: { [weak self] in self?.root.area.tiles.isEmpty ?? true }) }
 
     func setup() {
         win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1440, height: 860), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
@@ -1832,6 +1934,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { ok, err in log("notifications allowed: \(ok) \(String(describing: err))") }
         Scores.shared.start()
+        Updater.shared.onStatus = { [weak self] msg in
+            log("[update] " + msg)
+            guard let self else { return }
+            if let t = self.root.area.active { t.toast(msg) } else { self.root.sidebar.header.stringValue = msg }
+        }
+        Updater.shared.check(manual: false, canRestartNow: { [weak self] in self?.root.area.tiles.isEmpty ?? true })
         Party.shared.area = root.area
         Party.shared.onUI = { [weak self] in self?.root.sidebar.updateParty() }
         root.sidebar.onPartyStart = { [weak self] in self?.partyStart() }
@@ -2038,7 +2146,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             if responds(to: sel) { i.target = self }
             return i
         }
-        sub("Streamed", [item("Streamed ausblenden", #selector(NSApplication.hide(_:)), "h"),
+        sub("Streamed", [item("Nach Updates suchen…", #selector(checkUpdates), "u"),
+                         item("Streamed ausblenden", #selector(NSApplication.hide(_:)), "h"),
                          .separator(),
                          item("Streamed beenden", #selector(NSApplication.terminate(_:)), "q")])
         sub("Bearbeiten", [item("Ausschneiden", #selector(NSText.cut(_:)), "x"),
