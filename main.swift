@@ -13,6 +13,7 @@ let API = "https://streamed.pk/api"
 let UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
 let MAX_TILES = 6
 let UD = UserDefaults.standard
+let BG = ProcessInfo.processInfo.arguments.contains("--bg")
 
 func rgb(_ h: Int, _ a: CGFloat = 1) -> NSColor {
     NSColor(srgbRed: CGFloat((h >> 16) & 255) / 255, green: CGFloat((h >> 8) & 255) / 255, blue: CGFloat(h & 255) / 255, alpha: a)
@@ -288,6 +289,7 @@ struct EspnEvent { let id: String; let home: Set<String>; let away: Set<String>;
 }
 
 func notifyGoal(_ title: String, _ body: String) {
+    if BG { return }
     let c = UNMutableNotificationContent()
     c.title = title; c.body = body; c.sound = .default
     UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil)) { err in
@@ -781,6 +783,7 @@ final class Probe {
     let start = nowMs()
     var lastT = -1.0, h = 0, startedAt = 0.0, lastProgress = nowMs()
     var dead = false
+    var goodSince = 0.0
     init(web: WKWebView, url: String) { self.web = web; self.url = url }
 }
 
@@ -890,6 +893,7 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
         cfg.websiteDataStore = .default()
         cfg.mediaTypesRequiringUserActionForPlayback = []
         cfg.preferences.javaScriptCanOpenWindowsAutomatically = false
+        if #available(macOS 14.0, *) { cfg.preferences.inactiveSchedulingPolicy = .none }
         if let rl = ruleList { cfg.userContentController.add(rl) }
         cfg.userContentController.addUserScript(WKUserScript(source: SHIM, injectionTime: .atDocumentStart, forMainFrameOnly: true))
         cfg.userContentController.addUserScript(WKUserScript(source: FS_HOOK, injectionTime: .atDocumentStart, forMainFrameOnly: false))
@@ -905,109 +909,152 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
         return w
     }
 
-    // MARK: parallel probing + hot standby
+    // MARK: background pool – every other stream keeps playing muted (active tile)
     var probes: [Probe] = []
-    var standby: Probe?
-    var probeUntil = 0.0
+    var retryAt: [String: Double] = [:]
+    var lastAdoptAt = 0.0
+    var openedAt = 0.0
+    var rewound = false
     var hostFor: [ObjectIdentifier: String] = [:]
+    static let POOL_MAX = 7
 
     func killProbe(_ p: Probe) {
         p.dead = true
         p.web.stopLoading(); p.web.loadHTMLString("", baseURL: nil); p.web.removeFromSuperview()
         hostFor[ObjectIdentifier(p.web)] = nil
     }
-    func killProbes(keepStandby: Bool) {
-        probes.forEach(killProbe); probes = []
-        if !keepStandby, let s = standby { killProbe(s); standby = nil }
-    }
+    func killProbes() { probes.forEach(killProbe); probes = [] }
     func ptitle(_ p: Probe) -> String { streams.first(where: { $0.url == p.url })?.title ?? "?" }
+    var curURL: String { current >= 0 && current < streams.count ? streams[current].url : "" }
+    var curH: Int { current >= 0 && current < heights.count ? heights[current] : 0 }
 
-    /// Load the next best streams muted in the background and race them.
-    func startProbes(max n: Int = 4) {
-        guard auto, listReady, !streams.isEmpty else { return }
-        killProbes(keepStandby: true)
-        let busy = Set([current >= 0 && current < streams.count ? streams[current].url : ""] + (standby.map { [$0.url] } ?? []))
-        var picked: [Int] = []
-        for i in streams.indices where !busy.contains(streams[i].url) && !failed[i] { picked.append(i); if picked.count >= n { break } }
-        guard !picked.isEmpty else { return }
-        probeUntil = nowMs() + 16000
-        for i in picked {
-            guard let url = URL(string: streams[i].url) else { continue }
-            let w = newWeb()
-            w.frame = bounds
-            addSubview(w, positioned: .below, relativeTo: web)
-            hostFor[ObjectIdentifier(w)] = host(streams[i].url)
-            var r = URLRequest(url: url)
-            r.setValue("https://streamed.pk/", forHTTPHeaderField: "Referer")
-            w.load(r)
-            probes.append(Probe(web: w, url: streams[i].url))
+    var poolLimit: Int {
+        guard auto, listReady, !streams.isEmpty else { return 0 }
+        if isActive { return Tile.POOL_MAX }
+        return started ? 0 : 4
+    }
+
+    func spawnProbe(_ i: Int) {
+        guard let url = URL(string: streams[i].url) else { return }
+        let w = newWeb()
+        w.frame = bounds
+        addSubview(w, positioned: .below, relativeTo: web)
+        hostFor[ObjectIdentifier(w)] = host(streams[i].url)
+        var r = URLRequest(url: url)
+        r.setValue("https://streamed.pk/", forHTTPHeaderField: "Referer")
+        w.load(r)
+        probes.append(Probe(web: w, url: streams[i].url))
+    }
+
+    /// Keep all other streams loaded and playing (muted), so a recovered or better stream can be taken over instantly.
+    func maintainPool() {
+        let now = nowMs()
+        for p in probes where p.dead {
+            killProbe(p)
+            retryAt[p.url] = now + (p.startedAt > 0 ? 15000 : 30000)
         }
-        log("[\(match.title)] probing \(picked.map { streams[$0].title })")
+        probes.removeAll { $0.dead }
+        let limit = poolLimit
+        if limit == 0 { if !probes.isEmpty { killProbes() }; return }
+        let cu = curURL
+        for p in probes where p.url == cu { killProbe(p) }
+        probes.removeAll { $0.dead }
+        if probes.count > limit {
+            let worst = probes.sorted { ($0.startedAt > 0 ? $0.h : -1) < ($1.startedAt > 0 ? $1.h : -1) }.prefix(probes.count - limit)
+            for p in worst { killProbe(p) }
+            probes.removeAll { $0.dead }
+        }
+        var have = Set(probes.map { $0.url }); have.insert(cu)
+        var added: [String] = []
+        for i in streams.indices where probes.count < limit {
+            let u = streams[i].url
+            if have.contains(u) || (retryAt[u] ?? 0) > now { continue }
+            spawnProbe(i); have.insert(u); added.append(streams[i].title)
+        }
+        if !added.isEmpty { log("[\(match.title)] pool + \(added) (\(probes.count) im Hintergrund)") }
     }
 
     func pollProbes() {
         let now = nowMs()
-        for p in probes + (standby.map { [$0] } ?? []) where !p.dead {
+        for p in probes where !p.dead {
             p.web.evaluateJavaScript("window.__mute=true;window.__userPaused=false;" + MONITOR) { [weak self, weak p] r, _ in
                 guard let self, let p, !p.dead, let s = r as? String,
                       let o = (try? JSONSerialization.jsonObject(with: Data(s.utf8))) as? [String: Any] else { return }
                 let v = (o["v"] as? NSNumber)?.intValue ?? 0, t = (o["t"] as? NSNumber)?.doubleValue ?? 0, h = (o["h"] as? NSNumber)?.intValue ?? 0
+                let now = nowMs()
                 if (o["bad"] as? NSNumber)?.boolValue == true { p.dead = true; return }
-                if (o["ads"] as? NSNumber)?.boolValue == true { p.lastProgress = nowMs(); return }
+                if (o["ads"] as? NSNumber)?.boolValue == true { p.lastProgress = now; p.goodSince = 0; return }
                 if v == 1 && h > 0 {
                     if p.lastT >= 0 && t > p.lastT + 0.05 {
-                        if p.startedAt == 0 { p.startedAt = nowMs(); log("[\(self.match.title)] probe \(self.ptitle(p)) \(h)p after \(Int(p.startedAt - p.start))ms") }
-                        p.h = max(p.h, h)
-                        p.lastProgress = nowMs()
-                    }
+                        if p.startedAt == 0 { p.startedAt = now; log("[\(self.match.title)] pool \(self.ptitle(p)) \(h)p nach \(Int(now - p.start))ms") }
+                        if p.goodSince == 0 { p.goodSince = now }
+                        p.h = h
+                        p.lastProgress = now
+                        if let i = self.streams.firstIndex(where: { $0.url == p.url }), i < self.heights.count {
+                            self.heights[i] = h
+                            if self.failed[i] { self.failed[i] = false; log("[\(self.match.title)] \(self.ptitle(p)) wieder da (\(h)p)") }
+                        }
+                    } else if now - p.lastProgress > 2500 { p.goodSince = 0 }
                     p.lastT = t
                 }
             }
-            if p.startedAt == 0 && now - p.start > 16000 { p.dead = true }
-            if p.startedAt > 0 && now - p.lastProgress > 10000 { p.dead = true; log("[\(match.title)] probe/standby \(ptitle(p)) stalled") }
+            if p.startedAt == 0 && now - p.start > 20000 { p.dead = true }
+            if p.startedAt > 0 && now - p.lastProgress > 10000 { p.dead = true; log("[\(match.title)] pool \(ptitle(p)) hängt – später nochmal") }
         }
         decideProbes()
     }
 
+    func bestReady(stable: Double = 0) -> Probe? {
+        let now = nowMs()
+        return probes.filter { !$0.dead && $0.startedAt > 0 && $0.goodSince > 0 && now - $0.goodSince >= stable }
+            .max { $0.h != $1.h ? $0.h < $1.h : $0.goodSince > $1.goodSince }
+    }
+
     func decideProbes() {
-        for p in probes where p.dead { killProbe(p) }
-        probes.removeAll { $0.dead }
-        if let s = standby, s.dead { killProbe(s); standby = nil; log("[\(match.title)] standby lost") }
-        guard auto else { killProbes(keepStandby: false); return }
-        let curH = current >= 0 && current < heights.count ? heights[current] : 0
-        let ready = probes.filter { $0.startedAt > 0 }.sorted { $0.h != $1.h ? $0.h > $1.h : $0.startedAt < $1.startedAt }
-        if let best = ready.first, (!started && (best.h >= 1080 || nowMs() - best.startedAt > 2500)) || (started && best.h > curH + 50) {
-            adopt(best, why: started ? "Bessere Qualität gefunden" : "Schnellster Stream")
+        guard auto, !probes.isEmpty else { return }
+        let now = nowMs()
+        if !started {
+            if let b = bestReady(), b.h >= 1080 || now - b.startedAt > 2500 { adopt(b, why: "Schnellster Stream") }
             return
         }
-        guard !probes.isEmpty else { return }
-        let settled = probes.allSatisfy { $0.startedAt > 0 || $0.dead }
-        if nowMs() > probeUntil || (started && (settled || curH >= 1080)) {
-            if standby == nil, isActive, let b = ready.first {
-                standby = b
-                probes.removeAll { $0 === b }
-                log("[\(match.title)] standby ready: \(ptitle(b)) \(b.h)p")
-            }
-            probes.forEach(killProbe); probes = []
+        if userPaused || rewound { return }
+        if freezeStart != 0 && now - freezeStart > 3500, let b = bestReady(stable: 1500) {
+            adopt(b, why: "Hänger → anderer Stream lief schon, sofort gewechselt", keepOld: true)
+            return
+        }
+        let fresh = now - openedAt < 30000
+        guard fresh || now - lastAdoptAt > 8000 else { return }
+        if let b = bestReady(stable: fresh ? 500 : 3000), b.h > curH + 50 {
+            adopt(b, why: "Bessere Qualität gefunden", keepOld: true)
         }
     }
 
     /// Swap a background stream that is already playing into the visible slot (no reload, no wait).
-    func adopt(_ p: Probe, why: String) {
-        guard let i = streams.firstIndex(where: { $0.url == p.url }) else { killProbe(p); return }
+    func adopt(_ p: Probe, why: String, keepOld: Bool = false) {
         probes.removeAll { $0 === p }
-        if standby === p { standby = nil }
+        guard let i = streams.firstIndex(where: { $0.url == p.url }) else { killProbe(p); return }
         let old: WKWebView = web
+        let oldURL = curURL, oldH = curH, oldOK = started && freezeStart == 0
         hostFor[ObjectIdentifier(p.web)] = nil
         addSubview(p.web, positioned: .above, relativeTo: old)
         web = p.web
-        old.stopLoading(); old.loadHTMLString("", baseURL: nil); old.removeFromSuperview()
+        if keepOld && !oldURL.isEmpty && oldURL != p.url && old !== p.web {
+            let q = Probe(web: old, url: oldURL)
+            let n = nowMs()
+            q.startedAt = n; q.h = oldH; q.lastProgress = n; q.goodSince = oldOK ? n : 0
+            hostFor[ObjectIdentifier(old)] = host(oldURL)
+            old.evaluateJavaScript("window.__mute=true;var v=document.querySelector('.jw-media video')||document.querySelector('video');if(v)v.muted=true;try{jwplayer().setMute(true)}catch(e){}", completionHandler: nil)
+            probes.append(q)
+        } else {
+            old.stopLoading(); old.loadHTMLString("", baseURL: nil); old.removeFromSuperview()
+        }
         current = i
         failed[i] = false
+        retryAt[p.url] = nil
         homeHost = host(p.url)
-        userPaused = false; hardError = false; manifestSeen = true
+        userPaused = false; hardError = false; manifestSeen = true; rewound = false
         lastT = -1; freezeStart = 0; stalls = []; errCount = 0; lastPollAt = 0
-        streamStart = p.start; lastProgressAt = nowMs()
+        streamStart = p.start; lastProgressAt = nowMs(); lastAdoptAt = nowMs()
         log("[\(match.title)] adopt \(streams[i].title) \(p.h)p (\(why))")
         applyAudio()
         onStarted(p.h)
@@ -1022,7 +1069,6 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
         let w = bounds.width, h = bounds.height
         web.frame = bounds
         for p in probes { p.web.frame = bounds }
-        standby?.web.frame = bounds
         bar.frame = NSRect(x: 0, y: 0, width: w, height: 40)
         closeBtn.frame = NSRect(x: w - 34, y: 8, width: 26, height: 24)
         streamBtn.frame = NSRect(x: w - 34 - 98, y: 8, width: 92, height: 24)
@@ -1119,7 +1165,9 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
     // MARK: stream control
 
     func open(_ m: Match) {
-        killProbes(keepStandby: false)
+        killProbes()
+        retryAt = [:]
+        openedAt = nowMs()
         match = m
         Scores.shared.register([m])
         listReady = false; auto = true; current = -1; deadUrl = nil
@@ -1183,12 +1231,13 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
             let f = nextCandidate(from: -1)
             if f >= 0 { play(f, "Auto") }
         }
-        startProbes()
+        maintainPool()
     }
 
     func play(_ i: Int, _ why: String) {
         guard i >= 0, i < streams.count, let url = URL(string: streams[i].url) else { return }
         current = i
+        rewound = false
         started = false; userPaused = false; hardError = false; manifestSeen = false
         lastT = -1; freezeStart = 0; stalls = []; errCount = 0; lastPollAt = 0
         streamStart = nowMs(); lastProgressAt = streamStart
@@ -1205,7 +1254,7 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
 
     func playURL(_ url: String, title: String) {
         auto = false
-        killProbes(keepStandby: false)
+        killProbes()
         if let i = streams.firstIndex(where: { $0.url == url }) { failed[i] = false; play(i, "Watch-Party") }
         else {
             streams.append(StreamInfo(url: url, title: title.isEmpty ? "Party-Stream" : title, hd: true))
@@ -1220,6 +1269,7 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
         log("[party] remote \(p ? "pause" : "play")")
     }
     func seekToBehind(_ b: Double) {
+        rewound = b > 5
         web.evaluateJavaScript(seekBehindJS(b)) { [weak self] r, _ in
             guard let self else { return }
             self.lastT = -1; self.freezeStart = 0; self.lastProgressAt = nowMs()
@@ -1256,9 +1306,9 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
             updateChrome()
             return
         }
-        if auto, let sb = standby, !sb.dead, sb.startedAt > 0 {
-            adopt(sb, why: reason + " → Reserve-Stream sofort übernommen")
-            startProbes(max: 2)
+        retryAt[streams[current].url] = nowMs() + 12000
+        if auto, let sb = bestReady() {
+            adopt(sb, why: reason + " → lief schon im Hintergrund, sofort übernommen")
             return
         }
         var n = nextCandidate(from: current)
@@ -1269,7 +1319,6 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
             if n < 0 { failed[current] = false; n = current }
         }
         play(n, reason + " → nächster Stream")
-        if auto { startProbes(max: 3) }
     }
 
     func onStarted(_ h: Int) {
@@ -1293,8 +1342,8 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
     }
 
     func poll() {
-        if !isActive, let sb = standby { killProbe(sb); standby = nil }
-        if !probes.isEmpty || standby != nil { pollProbes() }
+        maintainPool()
+        if !probes.isEmpty { pollProbes() }
         guard current >= 0 else { return }
         let cur = current
         web.evaluateJavaScript("window.__mute=\(muted);" + MONITOR) { [weak self] r, _ in
@@ -1352,7 +1401,7 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
     func step(_ dir: Int) {
         guard !streams.isEmpty else { return }
         auto = false
-        killProbes(keepStandby: false)
+        killProbes()
         let n = streams.count
         let i = (((current < 0 ? 0 : current) + dir) % n + n) % n
         failed[i] = false
@@ -1365,7 +1414,7 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
             let b = nextCandidate(from: -1)
             if b >= 0 && b != current { play(b, "Auto") }
         }
-        startProbes()
+        maintainPool()
         updateChrome()
     }
     func reload() { if current >= 0 { play(current, "Neu geladen") } else { open(match) } }
@@ -1380,13 +1429,14 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
             let win = (o["win"] as? NSNumber)?.intValue ?? 0
             let clamped = (o["clamped"] as? NSNumber)?.intValue ?? 0
             self.lastT = -1; self.freezeStart = 0; self.lastProgressAt = nowMs()
+            self.rewound = behind > 5
             log("[\(self.match.title)] seek \(Int(d))s -> \(behind)s hinter Live (Puffer \(win)s)")
             if clamped == 1 { self.toast("Weiter zurück geht nicht – Stream puffert nur \(win) s\n\(behind) s hinter Live") }
             else { self.toast(behind <= 3 ? "Live" : "\(behind) s hinter Live  ·  → vor · L = Live") }
             Party.shared.local(self)
         }
     }
-    func goLive() { web.evaluateJavaScript(GO_LIVE, completionHandler: nil); userPaused = false; toast("Live"); Party.shared.local(self) }
+    func goLive() { web.evaluateJavaScript(GO_LIVE, completionHandler: nil); userPaused = false; rewound = false; toast("Live"); Party.shared.local(self) }
     func togglePause() {
         web.evaluateJavaScript(PAUSE_JS) { [weak self] r, _ in
             guard let self else { return }
@@ -1399,7 +1449,7 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
         updateChrome()
     }
     func shutdown() {
-        killProbes(keepStandby: false)
+        killProbes()
         openToken += 1
         current = -1
         web.stopLoading()
@@ -1437,7 +1487,7 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
         m.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 4), in: sender)
     }
     @objc func menuAuto() { setAuto() }
-    @objc func menuStream(_ i: NSMenuItem) { auto = false; killProbes(keepStandby: false); failed[i.tag] = false; play(i.tag, "Manuell gewählt") }
+    @objc func menuStream(_ i: NSMenuItem) { auto = false; killProbes(); failed[i.tag] = false; play(i.tag, "Manuell gewählt") }
     @objc func menuLive() { goLive() }
     @objc func menuSolo() { area?.toggleSolo(self) }
     @objc func backTapped() { area?.setActive(self); seek(-10) }
@@ -1460,7 +1510,7 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-        guard webView === web else { (probes + (standby.map { [$0] } ?? [])).first { $0.web === webView }?.dead = true; return }
+        guard webView === web else { probes.first { $0.web === webView }?.dead = true; return }
         let e = error as NSError
         let hard = [NSURLErrorCannotFindHost, NSURLErrorCannotConnectToHost, NSURLErrorTimedOut, NSURLErrorSecureConnectionFailed,
                     NSURLErrorNetworkConnectionLost, NSURLErrorDNSLookupFailed, NSURLErrorServerCertificateUntrusted]
@@ -1472,7 +1522,7 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-        guard webView === web else { (probes + (standby.map { [$0] } ?? [])).first { $0.web === webView }?.dead = true; return }
+        guard webView === web else { probes.first { $0.web === webView }?.dead = true; return }
         log("[\(match.title)] web process gone")
         if current >= 0 { play(current, "Neu geladen") }
     }
@@ -1893,8 +1943,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         root = RootView(frame: win.contentView!.bounds)
         win.contentView = root
         win.delegate = self
-        if !win.setFrameUsingName("StreamedMain") { win.center() }
-        win.setFrameAutosaveName("StreamedMain")
+        if BG { win.setFrame(NSRect(x: 40, y: 40, width: 960, height: 560), display: false) } else {
+            if !win.setFrameUsingName("StreamedMain") { win.center() }
+            win.setFrameAutosaveName("StreamedMain")
+        }
         root.sidebar.onOpen = { [weak self] m, rep in self?.root.area.add(m, replace: rep) }
         root.sidebar.onForceNew = { [weak self] m in
             guard let self else { return }
@@ -1909,8 +1961,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             guard let self else { return }
             if on != self.win.styleMask.contains(.fullScreen) { self.win.toggleFullScreen(nil) }
         }
-        win.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        if BG { root.area.muteAll = true; win.title = "Streamed (Test)"; win.orderBack(nil) } else {
+            win.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        }
         root.sidebar.load()
         win.makeFirstResponder(root.sidebar.table)
         timers.append(Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
@@ -1939,7 +1993,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             guard let self else { return }
             if let t = self.root.area.active { t.toast(msg) } else { self.root.sidebar.header.stringValue = msg }
         }
-        Updater.shared.check(manual: false, canRestartNow: { [weak self] in self?.root.area.tiles.isEmpty ?? true })
+        if !BG { Updater.shared.check(manual: false, canRestartNow: { [weak self] in self?.root.area.tiles.isEmpty ?? true }) }
         Party.shared.area = root.area
         Party.shared.onUI = { [weak self] in self?.root.sidebar.updateParty() }
         root.sidebar.onPartyStart = { [weak self] in self?.partyStart() }
@@ -2014,9 +2068,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if n > 1 { setMulti(true) }
         Task {
             guard let arr = await getJSON("/matches/live") as? [[String: Any]] else { return }
-            let ms = arr.compactMap { Match($0) }.filter { !$0.is247 }.sorted {
+            var ms = arr.compactMap { Match($0) }.filter { !$0.is247 }.sorted {
                 ($0.category == "football" ? 0 : 1, $0.popular ? 0 : 1) < ($1.category == "football" ? 0 : 1, $1.popular ? 0 : 1)
             }
+            let av = ProcessInfo.processInfo.arguments
+            if let j = av.firstIndex(of: "--match"), j + 1 < av.count { let q = av[j + 1].lowercased(); ms = ms.filter { $0.title.lowercased().contains(q) } }
             for m in ms.prefix(n) { root.area.add(m, replace: false) }
         }
     }
