@@ -23,13 +23,21 @@ let C_BG = rgb(0x0B0F17), C_CARD = rgb(0x161C28), C_ACCENT = rgb(0xE5484D), C_TE
 func nowMs() -> Double { ProcessInfo.processInfo.systemUptime * 1000 }
 
 let logURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/Streamed.log")
+let logQ = DispatchQueue(label: "streamed.log")
+let logFmt: DateFormatter = { let f = DateFormatter(); f.dateFormat = "HH:mm:ss.SSS"; return f }()
+nonisolated(unsafe) var logHandle: FileHandle?
 func log(_ s: String) {
-    let f = DateFormatter(); f.dateFormat = "HH:mm:ss.SSS"
-    let line = f.string(from: Date()) + " [\(getpid())] " + s + "\n"
-    guard let data = line.data(using: .utf8) else { return }
-    if let h = try? FileHandle(forWritingTo: logURL) {
-        h.seekToEndOfFile(); h.write(data); try? h.close()
-    } else { try? data.write(to: logURL) }
+    let d = Date()
+    logQ.async {
+        let line = logFmt.string(from: d) + " [\(getpid())] " + s + "\n"
+        guard let data = line.data(using: .utf8) else { return }
+        if logHandle == nil {
+            if !FileManager.default.fileExists(atPath: logURL.path) { FileManager.default.createFile(atPath: logURL.path, contents: nil) }
+            logHandle = try? FileHandle(forWritingTo: logURL)
+        }
+        guard let h = logHandle else { return }
+        h.seekToEndOfFile(); h.write(data)
+    }
 }
 
 func host(_ u: String) -> String { URL(string: u)?.host?.lowercased() ?? "" }
@@ -105,7 +113,18 @@ func getJSON(_ path: String, timeout: TimeInterval = 10) async -> Any? {
     return try? JSONSerialization.jsonObject(with: d)
 }
 
-func fetchStreams(_ m: Match) async -> [StreamInfo] {
+func sortStreams(_ raw: [StreamInfo]) -> [StreamInfo] {
+    func lang(_ s: StreamInfo) -> Int { let l = s.title.lowercased(); return l.contains("english") || l.contains("german") ? 0 : 1 }
+    var seen = Set<String>()
+    return raw.filter { seen.insert($0.url).inserted }.sorted { a, b in
+        if a.hd != b.hd { return a.hd }
+        if lang(a) != lang(b) { return lang(a) < lang(b) }
+        return a.title < b.title
+    }
+}
+
+/// onFirst: called once as soon as the first source delivers an HD stream (so playback can start before slow sources answer).
+func fetchStreams(_ m: Match, onFirst: (@Sendable ([StreamInfo]) async -> Void)? = nil) async -> [StreamInfo] {
     let srcs = m.sources.map { ($0.source, $0.id) }
     let raw = await withTaskGroup(of: [StreamInfo].self) { g -> [StreamInfo] in
         for (source, id) in srcs {
@@ -122,16 +141,17 @@ func fetchStreams(_ m: Match) async -> [StreamInfo] {
             }
         }
         var out: [StreamInfo] = []
-        for await part in g { out += part }
+        var fired = false
+        for await part in g {
+            out += part
+            if !fired, let onFirst, out.contains(where: { $0.hd }) {
+                fired = true
+                await onFirst(sortStreams(out))
+            }
+        }
         return out
     }
-    func lang(_ s: StreamInfo) -> Int { let l = s.title.lowercased(); return l.contains("english") || l.contains("german") ? 0 : 1 }
-    var seen = Set<String>()
-    return raw.filter { seen.insert($0.url).inserted }.sorted { a, b in
-        if a.hd != b.hd { return a.hd }
-        if lang(a) != lang(b) { return lang(a) < lang(b) }
-        return a.title < b.title
-    }
+    return sortStreams(raw)
 }
 
 // MARK: - Live scores (ESPN public scoreboard) + goal alerts
@@ -1183,9 +1203,17 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
         } else {
             web.loadHTMLString("<body style='background:#000'></body>", baseURL: nil)
         }
+        let t0 = nowMs()
         Task { @MainActor [weak self] in
-            let rows = await fetchStreams(m)
+            let rows = await fetchStreams(m, onFirst: { [weak self] part in
+                await MainActor.run {
+                    guard let self, self.openToken == token, !self.listReady, self.current < 0 else { return }
+                    log("[\(m.title)] early start: \(part.count) streams after \(Int(nowMs() - t0))ms")
+                    self.onStreamList(part)
+                }
+            })
             guard let self, self.openToken == token else { return }
+            log("[\(m.title)] stream list: \(rows.count) streams after \(Int(nowMs() - t0))ms")
             self.onStreamList(rows)
         }
     }
@@ -1670,12 +1698,12 @@ final class MatchCell: NSTableCellView {
         t.frame = NSRect(x: 10, y: H / 2 - 1, width: W - rw - 28, height: 18)
         s.frame = NSRect(x: 10, y: H / 2 - 18, width: W - rw - 28, height: 15)
     }
+    static let fmt: DateFormatter = { let f = DateFormatter(); f.dateFormat = "HH:mm"; return f }()
     func set(_ m: Match, open: Bool) {
         t.stringValue = (open ? "● " : "") + m.title
         t.textColor = open ? C_ACCENT : C_TEXT
         s.stringValue = catName(m.category) + (m.popular ? "  ·  beliebt" : "")
-        let f = DateFormatter(); f.dateFormat = "HH:mm"
-        let time = f.string(from: Date(timeIntervalSince1970: Double(m.date) / 1000))
+        let time = MatchCell.fmt.string(from: Date(timeIntervalSince1970: Double(m.date) / 1000))
         r.stringValue = m.is247 ? "24/7" : (m.isLive ? "LIVE · " + time : time)
         r.textColor = m.isLive && !m.is247 ? C_ACCENT : C_MUTED
         if !open, let sc = Scores.shared.score(m) {
