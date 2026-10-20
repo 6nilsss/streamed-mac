@@ -73,7 +73,58 @@ func makeLabel(_ size: CGFloat, bold: Bool = false, color: NSColor = C_TEXT) -> 
 }
 
 class FlippedView: NSView { override var isFlipped: Bool { true } }
-final class PassView: FlippedView { override func hitTest(_ point: NSPoint) -> NSView? { nil } }
+
+func sym(_ name: String, _ size: CGFloat = 13, _ weight: NSFont.Weight = .semibold) -> NSImage? {
+    NSImage(systemSymbolName: name, accessibilityDescription: nil)?.withSymbolConfiguration(.init(pointSize: size, weight: weight))
+}
+func sportSymbol(_ c: String) -> String {
+    switch c {
+    case "football": return "soccerball"
+    case "basketball": return "basketball.fill"
+    case "american-football": return "football.fill"
+    case "hockey": return "hockey.puck.fill"
+    case "tennis": return "tennis.racket"
+    case "fight": return "figure.boxing"
+    case "motor-sports": return "flag.checkered"
+    case "baseball": return "baseball.fill"
+    default: return "sportscourt.fill"
+    }
+}
+/// Round translucent HUD button with an SF Symbol (like the QuickTime / TV app controls).
+final class HUDButton: NSButton {
+    init(_ symbol: String, size: CGFloat = 13, tip: String) {
+        super.init(frame: .zero)
+        isBordered = false
+        image = sym(symbol, size) ?? NSImage()
+        imagePosition = .imageOnly
+        contentTintColor = .white
+        wantsLayer = true
+        layer?.backgroundColor = NSColor(white: 1, alpha: 0.16).cgColor
+        toolTip = tip
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override func layout() { super.layout(); layer?.cornerRadius = bounds.height / 2 }
+}
+/// Gradient so the controls stay readable on any video frame.
+final class GradientView: PassView {
+    let g = CAGradientLayer()
+    var top = true
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        g.colors = [NSColor(white: 0, alpha: 0.75).cgColor, NSColor(white: 0, alpha: 0).cgColor]
+        layer?.addSublayer(g)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override func layout() { super.layout(); g.frame = bounds; g.startPoint = CGPoint(x: 0.5, y: 1); g.endPoint = CGPoint(x: 0.5, y: 0) }
+}
+func hud() -> NSVisualEffectView {
+    let v = NSVisualEffectView()
+    v.material = .hudWindow; v.blendingMode = .withinWindow; v.state = .active
+    v.wantsLayer = true; v.layer?.cornerRadius = 12; v.layer?.masksToBounds = true
+    return v
+}
+class PassView: FlippedView { override func hitTest(_ point: NSPoint) -> NSView? { nil } }
 
 // MARK: - Models / API
 
@@ -828,16 +879,18 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
     var isActive = false { didSet { updateChrome() } }
 
     let bar = FlippedView()
-    let titleL = makeLabel(13, bold: true)
-    let infoL = makeLabel(11, color: rgb(0xB8C0D0))
-    let streamBtn = NSButton()
-    let closeBtn = NSButton()
-    let backBtn = NSButton()
-    let fwdBtn = NSButton()
-    let toastBox = PassView()
+    let barBG = GradientView()
+    let titleL = makeLabel(14, bold: true)
+    let infoL = makeLabel(11, color: NSColor(white: 1, alpha: 0.72))
+    let streamBtn = HUDButton("list.bullet", tip: "Streams wählen")
+    let closeBtn = HUDButton("xmark", size: 11, tip: "Spiel schließen")
+    let backBtn = HUDButton("gobackward.10", tip: "10 Sekunden zurück (←)")
+    let fwdBtn = HUDButton("goforward.10", tip: "10 Sekunden vor (→)")
+    let liveBtn = HUDButton("dot.radiowaves.left.and.right", tip: "Zum Live-Punkt (L)")
+    let toastBox = hud()
     let toastL = NSTextField(wrappingLabelWithString: "")
     let border = PassView()
-    let goalBox = PassView()
+    let goalBox = hud()
     let goalL = NSTextField(wrappingLabelWithString: "")
     var goalTask: Task<Void, Never>?
     var barTask: Task<Void, Never>?
@@ -853,31 +906,19 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
         layer?.backgroundColor = NSColor.black.cgColor
         makeWeb()
 
-        bar.wantsLayer = true
-        bar.layer?.backgroundColor = NSColor(white: 0, alpha: 0.62).cgColor
-        for (b, t, a) in [(streamBtn, "Streams ▾", #selector(showMenu(_:))), (closeBtn, "✕", #selector(closeTapped)), (backBtn, "↺ 10", #selector(backTapped)), (fwdBtn, "10 ↻", #selector(fwdTapped))] {
-            b.isBordered = false
+        bar.addSubview(barBG)
+        for (b, a) in [(streamBtn, #selector(showMenu(_:))), (closeBtn, #selector(closeTapped)), (backBtn, #selector(backTapped)), (fwdBtn, #selector(fwdTapped)), (liveBtn, #selector(menuLive))] as [(NSButton, Selector)] {
             b.target = self
             b.action = a
-            b.attributedTitle = NSAttributedString(string: t, attributes: [.foregroundColor: NSColor.white, .font: NSFont.systemFont(ofSize: 12, weight: .semibold)])
             bar.addSubview(b)
         }
-        for b in [backBtn, fwdBtn] {
-            b.wantsLayer = true; b.layer?.cornerRadius = 6
-            b.layer?.backgroundColor = NSColor(white: 1, alpha: 0.10).cgColor
-        }
-        backBtn.toolTip = "10 Sekunden zurück (←)"
-        fwdBtn.toolTip = "10 Sekunden vor (→)"
-        streamBtn.wantsLayer = true
-        streamBtn.layer?.cornerRadius = 6
-        streamBtn.layer?.backgroundColor = NSColor(white: 1, alpha: 0.14).cgColor
+        titleL.textColor = .white
+        let sh = NSShadow(); sh.shadowColor = NSColor(white: 0, alpha: 0.6); sh.shadowBlurRadius = 3; sh.shadowOffset = .zero
+        titleL.shadow = sh
         bar.addSubview(titleL)
         bar.addSubview(infoL)
         addSubview(bar)
 
-        toastBox.wantsLayer = true
-        toastBox.layer?.backgroundColor = NSColor(white: 0, alpha: 0.72).cgColor
-        toastBox.layer?.cornerRadius = 8
         toastL.font = .systemFont(ofSize: 13, weight: .medium)
         toastL.textColor = .white
         toastL.maximumNumberOfLines = 2
@@ -885,9 +926,9 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
         toastBox.isHidden = true
         addSubview(toastBox)
 
-        goalBox.wantsLayer = true
-        goalBox.layer?.backgroundColor = C_ACCENT.withAlphaComponent(0.92).cgColor
-        goalBox.layer?.cornerRadius = 14
+        goalBox.layer?.cornerRadius = 22
+        goalBox.layer?.borderWidth = 1
+        goalBox.layer?.borderColor = NSColor(white: 1, alpha: 0.12).cgColor
         goalL.alignment = .center
         goalL.textColor = .white
         goalL.maximumNumberOfLines = 3
@@ -895,7 +936,7 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
         goalBox.isHidden = true
         addSubview(goalBox)
         border.wantsLayer = true
-        border.layer?.borderColor = C_ACCENT.cgColor
+        border.layer?.borderColor = NSColor.controlAccentColor.cgColor
         border.layer?.borderWidth = 0
         addSubview(border)
         showBar()
@@ -1089,25 +1130,36 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
         let w = bounds.width, h = bounds.height
         web.frame = bounds
         for p in probes { p.web.frame = bounds }
-        bar.frame = NSRect(x: 0, y: 0, width: w, height: 40)
-        closeBtn.frame = NSRect(x: w - 34, y: 8, width: 26, height: 24)
-        streamBtn.frame = NSRect(x: w - 34 - 98, y: 8, width: 92, height: 24)
-        fwdBtn.frame = NSRect(x: w - 34 - 98 - 50, y: 8, width: 44, height: 24)
-        backBtn.frame = NSRect(x: w - 34 - 98 - 100, y: 8, width: 44, height: 24)
-        let narrow = w < 380
-        backBtn.isHidden = narrow; fwdBtn.isHidden = narrow
-        let tw = max(40, w - (narrow ? 150 : 250))
-        titleL.frame = NSRect(x: 12, y: 4, width: tw, height: 18)
-        infoL.frame = NSRect(x: 12, y: 21, width: tw, height: 15)
+        // leave room for the traffic lights when this tile sits in the window's top-left corner
+        var lead: CGFloat = 14
+        if let win = window, !win.styleMask.contains(.fullScreen), let cv = win.contentView {
+            let p = convert(NSPoint.zero, to: cv)
+            if p.x < 10 && (cv.isFlipped ? p.y < 10 : p.y > cv.bounds.height - 10) { lead = 84 }
+        }
+        bar.frame = NSRect(x: 0, y: 0, width: w, height: 72)
+        barBG.frame = bar.bounds
+        let B: CGFloat = 28, y0: CGFloat = 12
+        closeBtn.frame = NSRect(x: w - 12 - B, y: y0, width: B, height: B)
+        streamBtn.frame = NSRect(x: closeBtn.frame.minX - 8 - B, y: y0, width: B, height: B)
+        liveBtn.frame = NSRect(x: streamBtn.frame.minX - 8 - B, y: y0, width: B, height: B)
+        fwdBtn.frame = NSRect(x: liveBtn.frame.minX - 8 - B, y: y0, width: B, height: B)
+        backBtn.frame = NSRect(x: fwdBtn.frame.minX - 8 - B, y: y0, width: B, height: B)
+        let narrow = w < 420
+        backBtn.isHidden = narrow; fwdBtn.isHidden = narrow; liveBtn.isHidden = narrow
+        let right = narrow ? streamBtn.frame.minX : backBtn.frame.minX
+        let tw = max(40, right - lead - 10)
+        titleL.frame = NSRect(x: lead, y: 10, width: tw, height: 19)
+        infoL.frame = NSRect(x: lead, y: 29, width: tw, height: 15)
         let maxW = max(80, min(w - 44, 440))
         toastL.preferredMaxLayoutWidth = maxW
         var s = toastL.intrinsicContentSize
         s.width = min(maxW, ceil(s.width)); s.height = ceil(s.height)
-        toastBox.frame = NSRect(x: 12, y: h - s.height - 30, width: s.width + 20, height: s.height + 14)
-        toastL.frame = NSRect(x: 10, y: 7, width: s.width, height: s.height)
+        toastBox.frame = NSRect(x: (w - s.width - 32) / 2, y: h - s.height - 96, width: s.width + 32, height: s.height + 20)
+        toastL.frame = NSRect(x: 16, y: 10, width: s.width, height: s.height)
+        toastBox.layer?.cornerRadius = min(14, toastBox.frame.height / 2)
         border.frame = bounds
         let gw = min(w - 40, 520), big: CGFloat = w < 500 ? 26 : 38
-        goalL.font = .systemFont(ofSize: big, weight: .heavy)
+        goalL.font = .systemFont(ofSize: big, weight: .bold)
         goalL.preferredMaxLayoutWidth = gw - 32
         let gs = goalL.intrinsicContentSize
         goalBox.frame = NSRect(x: (w - gw) / 2, y: (h - gs.height - 36) / 2, width: gw, height: ceil(gs.height) + 36)
@@ -1115,8 +1167,8 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
     }
 
     func goal(_ head: String, _ detail: String) {
-        let a = NSMutableAttributedString(string: "⚽ " + head + "\n", attributes: [.font: NSFont.systemFont(ofSize: bounds.width < 500 ? 24 : 36, weight: .heavy), .foregroundColor: NSColor.white])
-        a.append(NSAttributedString(string: detail, attributes: [.font: NSFont.systemFont(ofSize: bounds.width < 500 ? 13 : 17, weight: .semibold), .foregroundColor: NSColor.white]))
+        let a = NSMutableAttributedString(string: "⚽︎ " + head + "\n", attributes: [.font: NSFont.systemFont(ofSize: bounds.width < 500 ? 24 : 34, weight: .bold), .foregroundColor: NSColor.white])
+        a.append(NSAttributedString(string: detail, attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: bounds.width < 500 ? 13 : 16, weight: .medium), .foregroundColor: NSColor(white: 1, alpha: 0.8)]))
         let p = NSMutableParagraphStyle(); p.alignment = .center
         a.addAttribute(.paragraphStyle, value: p, range: NSRange(location: 0, length: a.length))
         goalL.attributedStringValue = a
@@ -1146,6 +1198,7 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
     }
     func hideBar(after sec: Double) {
         barTask?.cancel()
+        if ProcessInfo.processInfo.arguments.contains("--uitest") { return }
         barTask = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(sec * 1e9))
             guard let self, !Task.isCancelled else { return }
@@ -1169,8 +1222,8 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
     func updateChrome() {
         let multi = (area?.tiles.count ?? 1) > 1
         let t = match.title
-        titleL.stringValue = (isActive && multi && !(area?.muteAll ?? false) ? "🔊 " : "") + t
-        var parts = [auto ? "AUTO" : "MANUELL"]
+        titleL.stringValue = t
+        var parts = [(isActive && multi && !(area?.muteAll ?? false) ? "🔊 " : "") + (auto ? "Auto" : "Manuell")]
         if current >= 0 && current < streams.count {
             parts.append(streams[current].title)
             let h = current < heights.count ? heights[current] : 0
@@ -1178,8 +1231,8 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
         } else {
             parts.append(listReady ? "kein Stream" : "suche Streams…")
         }
-        infoL.stringValue = parts.joined(separator: "  ·  ")
-        border.layer?.borderWidth = isActive && multi ? 3 : 0
+        infoL.stringValue = parts.joined(separator: " · ")
+        border.layer?.borderWidth = isActive && multi ? 2 : 0
     }
 
     // MARK: stream control
@@ -1584,16 +1637,22 @@ final class PlayerArea: FlippedView {
         if solo != nil { solo = nil } else if let t { setActive(t); solo = t }
         onSolo?(solo != nil)
     }
-    let emptyL = NSTextField(wrappingLabelWithString: "Doppelklick auf ein Spiel links, um es zu starten.\nMehrere Spiele gleichzeitig: oben links „Multistream“ einschalten (bis zu 6).")
+    let emptyL = NSTextField(wrappingLabelWithString: "Doppelklick auf ein Spiel, um es zu starten.\nMehrere Spiele gleichzeitig: Multistream oben in der Seitenleiste einschalten.")
+    let emptyTitle = makeLabel(20, bold: true, color: NSColor(white: 1, alpha: 0.85))
+    let emptyIcon = NSImageView()
 
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
         layer?.backgroundColor = NSColor.black.cgColor
         emptyL.alignment = .center
-        emptyL.textColor = C_MUTED
-        emptyL.font = .systemFont(ofSize: 15)
-        addSubview(emptyL)
+        emptyL.textColor = NSColor(white: 1, alpha: 0.5)
+        emptyL.font = .systemFont(ofSize: 13)
+        emptyTitle.stringValue = "Kein Spiel geöffnet"
+        emptyTitle.alignment = .center
+        emptyIcon.image = sym("sportscourt", 54, .light)
+        emptyIcon.contentTintColor = NSColor(white: 1, alpha: 0.35)
+        addSubview(emptyIcon); addSubview(emptyTitle); addSubview(emptyL)
     }
     required init?(coder: NSCoder) { fatalError() }
 
@@ -1634,7 +1693,7 @@ final class PlayerArea: FlippedView {
     func applyAudio() { for x in tiles { x.applyAudio() } }
 
     func changed() {
-        emptyL.isHidden = !tiles.isEmpty
+        emptyL.isHidden = !tiles.isEmpty; emptyTitle.isHidden = !tiles.isEmpty; emptyIcon.isHidden = !tiles.isEmpty
         for t in tiles { t.updateChrome() }
         needsLayout = true
         onChange?()
@@ -1643,7 +1702,9 @@ final class PlayerArea: FlippedView {
     override func layout() {
         super.layout()
         let W = bounds.width, H = bounds.height, n = tiles.count, gap: CGFloat = 2
-        emptyL.frame = NSRect(x: 40, y: H / 2 - 30, width: max(0, W - 80), height: 60)
+        emptyIcon.frame = NSRect(x: W / 2 - 40, y: H / 2 - 96, width: 80, height: 64)
+        emptyTitle.frame = NSRect(x: 40, y: H / 2 - 20, width: max(0, W - 80), height: 26)
+        emptyL.frame = NSRect(x: 40, y: H / 2 + 14, width: max(0, W - 80), height: 40)
         guard n > 0 else { return }
         if let s = solo { s.frame = bounds; return }
         if focusMode && n > 1, let a = active {
@@ -1682,39 +1743,85 @@ final class MatchTable: NSTableView {
 }
 
 final class MatchCell: NSTableCellView {
-    let t = makeLabel(13, bold: true), s = makeLabel(11, color: C_MUTED), r = makeLabel(11, bold: true)
+    let t = makeLabel(13, bold: true, color: .labelColor), s = makeLabel(11, color: .secondaryLabelColor), r = makeLabel(11, color: .secondaryLabelColor)
+    let icon = NSImageView()
+    let iconBG = NSView()
+    let live = NSTextField(labelWithString: "LIVE")
+    override var isFlipped: Bool { true }
     init(_ id: NSUserInterfaceItemIdentifier) {
         super.init(frame: .zero)
         identifier = id
-        addSubview(t); addSubview(s); addSubview(r)
+        t.font = .systemFont(ofSize: 13, weight: .semibold)
+        r.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+        r.alignment = .right
+        iconBG.wantsLayer = true
+        iconBG.layer?.cornerRadius = 8
+        icon.imageScaling = .scaleProportionallyDown
+        live.font = .systemFont(ofSize: 9, weight: .heavy)
+        live.textColor = .white
+        live.alignment = .center
+        live.wantsLayer = true
+        live.drawsBackground = true
+        live.backgroundColor = .systemRed
+        live.layer?.cornerRadius = 4
+        live.layer?.masksToBounds = true
+        addSubview(iconBG); addSubview(icon); addSubview(t); addSubview(s); addSubview(r); addSubview(live)
     }
     required init?(coder: NSCoder) { fatalError() }
     override func layout() {
         super.layout()
         let W = bounds.width, H = bounds.height
+        iconBG.frame = NSRect(x: 6, y: (H - 32) / 2, width: 32, height: 32)
+        icon.frame = iconBG.frame.insetBy(dx: 7, dy: 7)
         r.sizeToFit()
-        let rw = r.frame.width
-        r.frame = NSRect(x: W - rw - 10, y: (H - 16) / 2, width: rw, height: 16)
-        t.frame = NSRect(x: 10, y: H / 2 - 1, width: W - rw - 28, height: 18)
-        s.frame = NSRect(x: 10, y: H / 2 - 18, width: W - rw - 28, height: 15)
+        let rw = min(110, r.frame.width)
+        let lw: CGFloat = live.isHidden ? 0 : 34
+        r.frame = NSRect(x: W - rw - 8, y: H / 2 - 1, width: rw, height: 15)
+        live.frame = NSRect(x: W - lw - 8, y: H / 2 - 17, width: lw, height: 14)
+        let tx: CGFloat = 48
+        t.frame = NSRect(x: tx, y: H / 2 - 18, width: W - tx - max(rw, lw) - 16, height: 18)
+        s.frame = NSRect(x: tx, y: H / 2 + 1, width: W - tx - max(rw, lw) - 16, height: 15)
     }
     static let fmt: DateFormatter = { let f = DateFormatter(); f.dateFormat = "HH:mm"; return f }()
     func set(_ m: Match, open: Bool) {
-        t.stringValue = (open ? "● " : "") + m.title
-        t.textColor = open ? C_ACCENT : C_TEXT
-        s.stringValue = catName(m.category) + (m.popular ? "  ·  beliebt" : "")
+        t.stringValue = m.title
+        t.textColor = .labelColor
+        s.stringValue = catName(m.category) + (m.popular ? " · Beliebt" : "")
+        icon.image = sym(open ? "play.fill" : sportSymbol(m.category), 15, .semibold) ?? sym("sportscourt.fill", 15)
+        icon.contentTintColor = open ? .white : .secondaryLabelColor
+        iconBG.layer?.backgroundColor = (open ? NSColor.controlAccentColor : NSColor.quaternaryLabelColor).cgColor
         let time = MatchCell.fmt.string(from: Date(timeIntervalSince1970: Double(m.date) / 1000))
-        r.stringValue = m.is247 ? "24/7" : (m.isLive ? "LIVE · " + time : time)
-        r.textColor = m.isLive && !m.is247 ? C_ACCENT : C_MUTED
+        live.isHidden = !(m.isLive && !m.is247)
+        r.stringValue = m.is247 ? "24/7" : time
+        r.textColor = .secondaryLabelColor
         if !open, let sc = Scores.shared.score(m) {
             r.stringValue = "\(sc.h):\(sc.a) · \(sc.clock)"
-            r.textColor = sc.state == "in" ? C_ACCENT : C_MUTED
+            r.textColor = sc.state == "in" ? .labelColor : .secondaryLabelColor
         }
         needsLayout = true
     }
 }
 
 final class Sidebar: FlippedView, NSTableViewDataSource, NSTableViewDelegate {
+    let fx = NSVisualEffectView()
+    let sep = NSBox()
+    let partyCard = NSView()
+    let partyIcon = NSImageView()
+    let keysBtn = NSButton()
+    let keysPop = NSPopover()
+    @objc func showKeys(_ b: NSButton) {
+        let l = NSTextField(wrappingLabelWithString: hint.stringValue)
+        l.font = .systemFont(ofSize: 12)
+        l.preferredMaxLayoutWidth = 320
+        let vc = NSViewController()
+        let v = NSView(frame: NSRect(x: 0, y: 0, width: 352, height: ceil(l.intrinsicContentSize.height) + 28))
+        l.frame = NSRect(x: 16, y: 14, width: 320, height: ceil(l.intrinsicContentSize.height))
+        v.addSubview(l)
+        vc.view = v
+        keysPop.contentViewController = vc
+        keysPop.behavior = .transient
+        keysPop.show(relativeTo: b.bounds, of: b, preferredEdge: .maxY)
+    }
     var all: [Match] = [], shown: [Match] = []
     let tabs = NSSegmentedControl(labels: ["Live", "Fußball", "Heute"], trackingMode: .selectOne, target: nil, action: nil)
     let search = NSSearchField()
@@ -1742,8 +1849,9 @@ final class Sidebar: FlippedView, NSTableViewDataSource, NSTableViewDelegate {
     @objc func pEmoji(_ b: NSButton) { Party.shared.chat(b.title) }
     func updateParty() {
         let on = Party.shared.active
-        partyTitle.stringValue = on ? "🎉 WATCH-PARTY" : "WATCH-PARTY"
-        partyTitle.textColor = on ? C_ACCENT : C_MUTED
+        partyTitle.stringValue = "Watch-Party"
+        partyTitle.textColor = .labelColor
+        partyIcon.contentTintColor = on ? .controlAccentColor : .secondaryLabelColor
         partyStatus.stringValue = Party.shared.status
         for v in [partyStart, partyJoin] as [NSView] { v.isHidden = on }
         for v in [partyCopy, partyLeave, chatField] as [NSView] { v.isHidden = !on }
@@ -1751,10 +1859,11 @@ final class Sidebar: FlippedView, NSTableViewDataSource, NSTableViewDelegate {
         needsLayout = true
     }
     var onMulti: ((Bool) -> Void)?
-    let multiBtn = NSButton(title: "▦ Multistream", target: nil, action: nil)
+    let multiBtn = NSButton(title: "", target: nil, action: nil)
     func setMulti(_ on: Bool) {
         multiBtn.state = on ? .on : .off
-        multiBtn.contentTintColor = on ? C_ACCENT : nil
+        multiBtn.contentTintColor = on ? .controlAccentColor : .secondaryLabelColor
+        multiBtn.image = sym(on ? "square.grid.2x2.fill" : "square.grid.2x2", 15, .regular)
         hint.stringValue = (on ? "Multistream AN: Doppelklick / ↩ = neue Kachel  ·  ⌥ = aktive ersetzen\nKlick auf Kachel = Ton  ·  G Raster/Fokus  ·  1–6 Kachel\n" : "Doppelklick / ↩ = Spiel öffnen (ersetzt das laufende)\nRechtsklick = als zusätzliche Kachel (Multistream)\n") + "Doppelklick / F = Vollbild · Esc raus · S Liste\n← → 10 s spulen · L Live · [ ] Stream · A Auto · M Ton · ␣ Pause"
     }
     @objc func multiTapped() { onMulti?(multiBtn.state == .on) }
@@ -1763,9 +1872,34 @@ final class Sidebar: FlippedView, NSTableViewDataSource, NSTableViewDelegate {
 
     override init(frame: NSRect) {
         super.init(frame: frame)
-        wantsLayer = true
-        layer?.backgroundColor = C_BG.cgColor
+        fx.material = .sidebar
+        fx.blendingMode = .behindWindow
+        fx.state = .followsWindowActiveState
+        addSubview(fx)
+        sep.boxType = .separator
+        addSubview(sep)
         logo.stringValue = "Streamed"
+        logo.font = .systemFont(ofSize: 22, weight: .bold)
+        logo.textColor = .labelColor
+        header.font = .systemFont(ofSize: 11, weight: .semibold)
+        header.textColor = .tertiaryLabelColor
+        partyCard.wantsLayer = true
+        partyCard.layer?.cornerRadius = 12
+        partyCard.layer?.backgroundColor = NSColor(white: 1, alpha: 0.06).cgColor
+        partyCard.layer?.borderWidth = 0.5
+        partyCard.layer?.borderColor = NSColor(white: 1, alpha: 0.08).cgColor
+        addSubview(partyCard)
+        partyIcon.image = sym("person.2.fill", 13, .semibold)
+        addSubview(partyIcon)
+        keysBtn.isBordered = false
+        keysBtn.image = sym("keyboard", 13, .regular)
+        keysBtn.imagePosition = .imageLeading
+        keysBtn.imageHugsTitle = true
+        keysBtn.attributedTitle = NSAttributedString(string: " Tastenkürzel", attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor])
+        keysBtn.contentTintColor = .secondaryLabelColor
+        keysBtn.target = self
+        keysBtn.action = #selector(showKeys(_:))
+        addSubview(keysBtn)
         tabs.selectedSegment = 0
         tabs.segmentDistribution = .fillEqually
         tabs.target = self
@@ -1777,10 +1911,10 @@ final class Sidebar: FlippedView, NSTableViewDataSource, NSTableViewDelegate {
         let col = NSTableColumn(identifier: .init("c"))
         table.addTableColumn(col)
         table.headerView = nil
-        table.rowHeight = 46
-        table.style = .plain
+        table.rowHeight = 50
+        table.style = .sourceList
         table.backgroundColor = .clear
-        table.intercellSpacing = NSSize(width: 0, height: 4)
+        table.intercellSpacing = NSSize(width: 0, height: 2)
         table.dataSource = self
         table.delegate = self
         table.target = self
@@ -1798,22 +1932,26 @@ final class Sidebar: FlippedView, NSTableViewDataSource, NSTableViewDelegate {
         hint.font = .systemFont(ofSize: 10.5)
         hint.textColor = C_MUTED
         partyStatus.font = .systemFont(ofSize: 11)
-        partyStatus.textColor = C_TEXT
+        partyStatus.textColor = .secondaryLabelColor
         partyStatus.maximumNumberOfLines = 3
         for (b, sel) in [(partyStart, #selector(pStart)), (partyJoin, #selector(pJoin)), (partyCopy, #selector(pCopy)), (partyLeave, #selector(pLeave))] {
-            b.bezelStyle = .rounded; b.controlSize = .small; b.font = .systemFont(ofSize: 11); b.target = self; b.action = sel
+            b.bezelStyle = .rounded; b.controlSize = .regular; b.font = .systemFont(ofSize: 12); b.target = self; b.action = sel
         }
         chatField.placeholderString = "Nachricht an die Party… (↩)"
         chatField.font = .systemFont(ofSize: 12)
         chatField.target = self
         chatField.action = #selector(pChat)
-        for b in emojiBtns { b.bezelStyle = .rounded; b.font = .systemFont(ofSize: 15); b.target = self; b.action = #selector(pEmoji(_:)) }
+        partyStart.keyEquivalent = ""
+        partyStart.bezelColor = .controlAccentColor
+        chatField.bezelStyle = .roundedBezel
+        for b in emojiBtns { b.isBordered = false; b.font = .systemFont(ofSize: 17); b.target = self; b.action = #selector(pEmoji(_:)); b.wantsLayer = true; b.layer?.cornerRadius = 8; b.layer?.backgroundColor = NSColor(white: 1, alpha: 0.06).cgColor }
         multiBtn.setButtonType(.pushOnPushOff)
-        multiBtn.bezelStyle = .rounded
+        multiBtn.isBordered = false
+        multiBtn.imagePosition = .imageOnly
         multiBtn.target = self
         multiBtn.action = #selector(multiTapped)
-        multiBtn.toolTip = "Mehrere Spiele gleichzeitig anzeigen"
-        for v in [logo, multiBtn, tabs, search, header, scroll, hint, partyTitle, partyStatus, partyStart, partyJoin, partyCopy, partyLeave, chatField] as [NSView] { addSubview(v) }
+        multiBtn.toolTip = "Multistream: mehrere Spiele gleichzeitig (⇧⌘N)"
+        for v in [logo, multiBtn, tabs, search, header, scroll, partyTitle, partyStatus, partyStart, partyJoin, partyCopy, partyLeave, chatField] as [NSView] { addSubview(v) }
         emojiBtns.forEach { addSubview($0) }
         updateParty()
     }
@@ -1822,29 +1960,35 @@ final class Sidebar: FlippedView, NSTableViewDataSource, NSTableViewDelegate {
     override func layout() {
         super.layout()
         let W = bounds.width, H = bounds.height, P: CGFloat = 16
-        multiBtn.sizeToFit()
-        let mw = multiBtn.frame.width + 8
-        multiBtn.frame = NSRect(x: W - P - mw, y: 14, width: mw, height: 24)
-        logo.frame = NSRect(x: P, y: 12, width: W - 2 * P - mw - 8, height: 28)
-        tabs.frame = NSRect(x: P, y: 46, width: W - 2 * P, height: 24)
-        search.frame = NSRect(x: P, y: 78, width: W - 2 * P, height: 24)
-        header.frame = NSRect(x: P, y: 108, width: W - 2 * P, height: 15)
-        let hintH: CGFloat = 62
+        fx.frame = bounds
+        sep.frame = NSRect(x: W - 1, y: 0, width: 1, height: H)
+        let cw = W - 1   // content width without the separator
+        multiBtn.frame = NSRect(x: cw - P - 28, y: 9, width: 28, height: 24)   // in the title bar, next to the traffic lights
+        logo.frame = NSRect(x: P, y: 44, width: cw - 2 * P, height: 30)
+        tabs.frame = NSRect(x: P, y: 82, width: cw - 2 * P, height: 24)
+        search.frame = NSRect(x: P, y: 116, width: cw - 2 * P, height: 26)
+        header.frame = NSRect(x: P + 2, y: 152, width: cw - 2 * P, height: 15)
         let on = Party.shared.active
-        let partyH: CGFloat = on ? 150 : 84
-        let py = H - hintH - 12 - partyH
-        partyTitle.frame = NSRect(x: P, y: py, width: W - 2 * P, height: 16)
-        partyStatus.frame = NSRect(x: P, y: py + 18, width: W - 2 * P, height: on ? 44 : 30)
-        let by = py + (on ? 64 : 52)
-        partyStart.frame = NSRect(x: P - 4, y: by, width: 120, height: 24)
-        partyJoin.frame = NSRect(x: P + 120, y: by, width: 110, height: 24)
-        partyCopy.frame = NSRect(x: P - 4, y: by, width: 120, height: 24)
-        partyLeave.frame = NSRect(x: P + 120, y: by, width: 100, height: 24)
-        chatField.frame = NSRect(x: P, y: by + 30, width: W - 2 * P, height: 22)
-        for (i, b) in emojiBtns.enumerated() { b.frame = NSRect(x: P - 4 + CGFloat(i) * 44, y: by + 56, width: 42, height: 26) }
-        scroll.frame = NSRect(x: 6, y: 128, width: W - 12, height: max(0, py - 128 - 8))
-        hint.frame = NSRect(x: P, y: H - hintH - 6, width: W - 2 * P, height: hintH)
-        table.tableColumns.first?.width = max(50, scroll.contentSize.width - 2)
+        let keysH: CGFloat = 30
+        let partyH: CGFloat = on ? 172 : 104
+        let py = H - keysH - 10 - partyH
+        partyCard.frame = NSRect(x: 10, y: py, width: cw - 20, height: partyH)
+        let ix = partyCard.frame.minX + 12, iw = partyCard.frame.width - 24
+        partyIcon.frame = NSRect(x: ix, y: py + 12, width: 18, height: 16)
+        partyTitle.frame = NSRect(x: ix + 24, y: py + 11, width: iw - 24, height: 18)
+        partyStatus.frame = NSRect(x: ix, y: py + 34, width: iw, height: on ? 44 : 30)
+        let by = py + (on ? 82 : 68)
+        let bw = (iw - 8) / 2
+        partyStart.frame = NSRect(x: ix - 2, y: by, width: bw + 4, height: 28)
+        partyJoin.frame = NSRect(x: ix + bw + 6, y: by, width: bw + 4, height: 28)
+        partyCopy.frame = partyStart.frame
+        partyLeave.frame = partyJoin.frame
+        chatField.frame = NSRect(x: ix, y: by + 34, width: iw, height: 24)
+        let ew = (iw - 4 * 6) / 5
+        for (i, b) in emojiBtns.enumerated() { b.frame = NSRect(x: ix + CGFloat(i) * (ew + 6), y: by + 64, width: ew, height: 28) }
+        scroll.frame = NSRect(x: 0, y: 172, width: cw, height: max(0, py - 172 - 8))
+        keysBtn.frame = NSRect(x: P - 2, y: H - keysH - 4, width: 120, height: keysH)
+        table.tableColumns.first?.width = max(50, scroll.contentSize.width - 28)
     }
 
     @objc func tabChanged() { all = []; shown = []; table.reloadData(); load() }
@@ -1855,11 +1999,11 @@ final class Sidebar: FlippedView, NSTableViewDataSource, NSTableViewDelegate {
         let token = loadToken
         let tab = max(0, tabs.selectedSegment)
         let path = ["/matches/live", "/matches/football", "/matches/all-today"][tab]
-        if all.isEmpty { header.stringValue = "Lade Spiele…" }
+        if all.isEmpty { header.stringValue = "LADE SPIELE…" }
         Task { @MainActor [weak self] in
             let arr = await getJSON(path) as? [[String: Any]]
             guard let self, token == self.loadToken else { return }
-            guard let arr else { self.header.stringValue = "Fehler beim Laden – Internet?"; return }
+            guard let arr else { self.header.stringValue = "FEHLER BEIM LADEN – INTERNET?"; return }
             let now = Int64(Date().timeIntervalSince1970 * 1000)
             var ms = arr.compactMap { Match($0) }
             if tab != 0 { ms = ms.filter { $0.is247 || $0.date > now - 4 * 3_600_000 } }
@@ -1884,7 +2028,7 @@ final class Sidebar: FlippedView, NSTableViewDataSource, NSTableViewDelegate {
         shown = q.isEmpty ? all : all.filter { $0.title.lowercased().contains(q) || catName($0.category).lowercased().contains(q) }
         table.reloadData()
         if let sel, let i = shown.firstIndex(where: { $0.id == sel }) { table.selectRowIndexes([i], byExtendingSelection: false) }
-        header.stringValue = shown.isEmpty ? "Gerade keine Spiele." : "\(shown.count) Spiele"
+        header.stringValue = shown.isEmpty ? "GERADE KEINE SPIELE" : "\(shown.count) SPIELE"
     }
 
     func refreshMarks() {
@@ -1961,8 +2105,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc func checkUpdates() { Updater.shared.check(manual: true, canRestartNow: { [weak self] in self?.root.area.tiles.isEmpty ?? true }) }
 
     func setup() {
-        win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1440, height: 860), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+        win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1440, height: 860), styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
         win.title = "Streamed"
+        win.titlebarAppearsTransparent = true
+        win.titleVisibility = .hidden
         win.appearance = NSAppearance(named: .darkAqua)
         win.minSize = NSSize(width: 820, height: 480)
         win.collectionBehavior = [.fullScreenPrimary]
@@ -1994,6 +2140,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             NSApp.activate(ignoringOtherApps: true)
         }
         root.sidebar.load()
+        log("window \(win.windowNumber)")
         win.makeFirstResponder(root.sidebar.table)
         timers.append(Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.root.area.tiles.forEach { $0.poll() } }
@@ -2040,6 +2187,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             DispatchQueue.main.asyncAfter(deadline: .now() + 24) { log("[test] host pause"); a.active?.togglePause() }
             DispatchQueue.main.asyncAfter(deadline: .now() + 30) { log("[test] host play"); a.active?.togglePause() }
             DispatchQueue.main.asyncAfter(deadline: .now() + 36) { log("[test] host seek -20"); a.active?.seek(-20) }
+        }
+        if args.contains("--uitest") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 9) { [weak self] in
+                guard let t = self?.root.area.tiles.first else { return }
+                t.toast("Hotel 1 · Main · 1080p\nBessere Qualität gefunden")
+                t.goal("TOR! \(t.match.home)", "\(t.match.home) 1:0 \(t.match.away)  ·  23'")
+            }
         }
         if args.contains("--goaltest") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
