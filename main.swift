@@ -24,6 +24,14 @@ func nowMs() -> Double { ProcessInfo.processInfo.systemUptime * 1000 }
 
 let logURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/Streamed.log")
 let logQ = DispatchQueue(label: "streamed.log")
+/// Keep the log small: above 5 MB it is moved to Streamed.old.log at launch.
+func rotateLog() {
+    let fm = FileManager.default
+    guard let sz = (try? fm.attributesOfItem(atPath: logURL.path))?[.size] as? NSNumber, sz.intValue > 5_000_000 else { return }
+    let old = logURL.deletingLastPathComponent().appendingPathComponent("Streamed.old.log")
+    try? fm.removeItem(at: old)
+    try? fm.moveItem(at: logURL, to: old)
+}
 let logFmt: DateFormatter = { let f = DateFormatter(); f.dateFormat = "HH:mm:ss.SSS"; return f }()
 nonisolated(unsafe) var logHandle: FileHandle?
 func log(_ s: String) {
@@ -131,6 +139,7 @@ class PassView: FlippedView { override func hitTest(_ point: NSPoint) -> NSView?
 struct Match {
     let id: String, title: String, category: String, date: Int64, popular: Bool
     let home: String, away: String
+    let homeBadge: String, awayBadge: String
     let raw: [String: Any]
     let sources: [(source: String, id: String)]
     init?(_ d: [String: Any]) {
@@ -144,6 +153,7 @@ struct Match {
             if parts.count == 2 { h = parts[0]; a = parts[1] }
         }
         home = h; away = a
+        homeBadge = str((teams?["home"] as? [String: Any])?["badge"]); awayBadge = str((teams?["away"] as? [String: Any])?["badge"])
         raw = d
         let src = (d["sources"] as? [[String: Any]]) ?? []
         sources = src.map { (source: str($0["source"]), id: str($0["id"])) }.filter { !$0.source.isEmpty && !$0.id.isEmpty }
@@ -203,6 +213,34 @@ func fetchStreams(_ m: Match, onFirst: (@Sendable ([StreamInfo]) async -> Void)?
         return out
     }
     return sortStreams(raw)
+}
+
+// MARK: - Team badges (streamed.pk image API, cached in memory)
+
+@MainActor final class Badges {
+    static var cache: [String: NSImage] = [:]
+    static var loading = Set<String>()
+    static var onLoad: (() -> Void)?
+    static var pending = false
+    static func get(_ id: String) -> NSImage? {
+        if id.isEmpty { return nil }
+        if let i = cache[id] { return i }
+        if loading.contains(id) { return nil }
+        loading.insert(id)
+        Task { @MainActor in
+            guard let url = URL(string: "https://streamed.pk/api/images/badge/\(id).webp") else { return }
+            var r = URLRequest(url: url, cachePolicy: .returnCacheDataElseLoad, timeoutInterval: 10)
+            r.setValue(UA, forHTTPHeaderField: "User-Agent")
+            if let (d, resp) = try? await URLSession.shared.data(for: r), (resp as? HTTPURLResponse)?.statusCode == 200, let img = NSImage(data: d) {
+                cache[id] = img
+                if !pending {   // coalesce: one list refresh for a burst of badges
+                    pending = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { MainActor.assumeIsolated { pending = false; onLoad?() } }
+                }
+            }
+        }
+        return nil
+    }
 }
 
 // MARK: - Live scores (ESPN public scoreboard) + goal alerts
@@ -921,7 +959,7 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
 
         toastL.font = .systemFont(ofSize: 13, weight: .medium)
         toastL.textColor = .white
-        toastL.maximumNumberOfLines = 2
+        toastL.maximumNumberOfLines = 3
         toastBox.addSubview(toastL)
         toastBox.isHidden = true
         addSubview(toastBox)
@@ -973,6 +1011,9 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
     // MARK: background pool – every other stream keeps playing muted (active tile)
     var probes: [Probe] = []
     var retryAt: [String: Double] = [:]
+    var startFails: [Double] = []
+    var restUntil = 0.0
+    var hangSwitches: [Double] = []
     var lastAdoptAt = 0.0
     var openedAt = 0.0
     var rewound = false
@@ -1079,8 +1120,13 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
             return
         }
         if userPaused || rewound { return }
-        if freezeStart != 0 && now - freezeStart > 3500, let b = bestReady(stable: 1500) {
-            adopt(b, why: "Hänger → anderer Stream lief schon, sofort gewechselt", keepOld: true)
+        hangSwitches.removeAll { now - $0 > 60000 }
+        // several hang-switches within a minute usually mean our own connection hiccups (all streams stall) -> be more patient
+        let hangMs: Double = hangSwitches.count >= 2 ? 8000 : 3500
+        if freezeStart != 0 && now - freezeStart > hangMs, let b = bestReady(stable: 1500) {
+            hangSwitches.append(now)
+            if hangSwitches.count == 2 { log("[\(match.title)] viele Hänger hintereinander – warte jetzt länger vor dem Wechsel") }
+            adopt(b, why: "Hänger → sofort gewechselt", keepOld: true)
             return
         }
         let fresh = now - openedAt < 30000
@@ -1134,7 +1180,7 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
         var lead: CGFloat = 14
         if let win = window, !win.styleMask.contains(.fullScreen), let cv = win.contentView {
             let p = convert(NSPoint.zero, to: cv)
-            if p.x < 10 && (cv.isFlipped ? p.y < 10 : p.y > cv.bounds.height - 10) { lead = 84 }
+            if p.x < 10 && (cv.isFlipped ? p.y < 10 : p.y > cv.bounds.height - 10) { lead = 118 }
         }
         bar.frame = NSRect(x: 0, y: 0, width: w, height: 72)
         barBG.frame = bar.bounds
@@ -1239,6 +1285,7 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
 
     func open(_ m: Match) {
         killProbes()
+        restUntil = 0; startFails = []; hangSwitches = []
         retryAt = [:]
         openedAt = nowMs()
         match = m
@@ -1388,8 +1435,26 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
             return
         }
         retryAt[streams[current].url] = nowMs() + 12000
+        if !started {
+            let now = nowMs()
+            startFails.append(now)
+            startFails.removeAll { now - $0 > 180000 }
+            if startFails.count >= max(4, streams.count * 2) && bestReady() == nil {
+                // every stream failed repeatedly: probably over / not started yet. Stop burning CPU, retry quietly.
+                startFails = []
+                restUntil = now + 60000
+                killProbes()
+                web.stopLoading()
+                web.loadHTMLString("<body style='background:#000'></body>", baseURL: nil)
+                log("[\(match.title)] kein Stream erreichbar – Pause 60 s")
+                toast("Gerade kein Stream erreichbar\nVielleicht vorbei oder noch nicht gestartet – neuer Versuch in 60 s")
+                current = -1
+                updateChrome()
+                return
+            }
+        }
         if auto, let sb = bestReady() {
-            adopt(sb, why: reason + " → lief schon im Hintergrund, sofort übernommen")
+            adopt(sb, why: reason + " → sofort gewechselt")
             return
         }
         var n = nextCandidate(from: current)
@@ -1423,6 +1488,13 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
     }
 
     func poll() {
+        if restUntil > 0 {
+            if nowMs() < restUntil { return }
+            restUntil = 0
+            log("[\(match.title)] neuer Versuch nach Pause")
+            open(match)
+            return
+        }
         maintainPool()
         if !probes.isEmpty { pollProbes() }
         guard current >= 0 else { return }
@@ -1498,7 +1570,7 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
         maintainPool()
         updateChrome()
     }
-    func reload() { if current >= 0 { play(current, "Neu geladen") } else { open(match) } }
+    func reload() { restUntil = 0; if current >= 0 { play(current, "Neu geladen") } else { open(match) } }
     func seek(_ d: Double) {
         web.evaluateJavaScript(seekJS(d)) { [weak self] r, err in
             log("seek raw \(String(describing: r).prefix(400)) err \(String(describing: err))")
@@ -1746,6 +1818,7 @@ final class MatchCell: NSTableCellView {
     let t = makeLabel(13, bold: true, color: .labelColor), s = makeLabel(11, color: .secondaryLabelColor), r = makeLabel(11, color: .secondaryLabelColor)
     let icon = NSImageView()
     let iconBG = NSView()
+    let b1 = NSImageView(), b2 = NSImageView()
     let live = NSTextField(labelWithString: "LIVE")
     override var isFlipped: Bool { true }
     init(_ id: NSUserInterfaceItemIdentifier) {
@@ -1765,7 +1838,8 @@ final class MatchCell: NSTableCellView {
         live.backgroundColor = .systemRed
         live.layer?.cornerRadius = 4
         live.layer?.masksToBounds = true
-        addSubview(iconBG); addSubview(icon); addSubview(t); addSubview(s); addSubview(r); addSubview(live)
+        for b in [b1, b2] { b.imageScaling = .scaleProportionallyUpOrDown; b.wantsLayer = true; b.shadow = { let x = NSShadow(); x.shadowColor = NSColor(white: 0, alpha: 0.5); x.shadowBlurRadius = 2; return x }() }
+        addSubview(iconBG); addSubview(icon); addSubview(b1); addSubview(b2); addSubview(t); addSubview(s); addSubview(r); addSubview(live)
     }
     required init?(coder: NSCoder) { fatalError() }
     override func layout() {
@@ -1773,6 +1847,9 @@ final class MatchCell: NSTableCellView {
         let W = bounds.width, H = bounds.height
         iconBG.frame = NSRect(x: 6, y: (H - 32) / 2, width: 32, height: 32)
         icon.frame = iconBG.frame.insetBy(dx: 7, dy: 7)
+        let o = iconBG.frame.origin
+        b1.frame = NSRect(x: o.x + 1, y: o.y + 1, width: 19, height: 19)
+        b2.frame = NSRect(x: o.x + 12, y: o.y + 12, width: 19, height: 19)
         r.sizeToFit()
         let rw = min(110, r.frame.width)
         let lw: CGFloat = live.isHidden ? 0 : 34
@@ -1789,6 +1866,9 @@ final class MatchCell: NSTableCellView {
         s.stringValue = catName(m.category) + (m.popular ? " · Beliebt" : "")
         icon.image = sym(open ? "play.fill" : sportSymbol(m.category), 15, .semibold) ?? sym("sportscourt.fill", 15)
         icon.contentTintColor = open ? .white : .secondaryLabelColor
+        var badges = false
+        if !open, let i1 = Badges.get(m.homeBadge), let i2 = Badges.get(m.awayBadge) { b1.image = i1; b2.image = i2; badges = true }
+        b1.isHidden = !badges; b2.isHidden = !badges; icon.isHidden = badges
         iconBG.layer?.backgroundColor = (open ? NSColor.controlAccentColor : NSColor.quaternaryLabelColor).cgColor
         let time = MatchCell.fmt.string(from: Date(timeIntervalSince1970: Double(m.date) / 1000))
         live.isHidden = !(m.isLive && !m.is247)
@@ -2065,11 +2145,20 @@ final class Sidebar: FlippedView, NSTableViewDataSource, NSTableViewDelegate {
 final class RootView: FlippedView {
     let sidebar = Sidebar(frame: .zero)
     let area = PlayerArea(frame: .zero)
-    var sidebarVisible = true { didSet { sidebar.isHidden = !sidebarVisible; needsLayout = true } }
+    var sidebarVisible = true { didSet { sidebar.isHidden = !sidebarVisible; needsLayout = true; area.needsLayout = true; area.tiles.forEach { $0.needsLayout = true } } }
+    let sideBtn = NSButton()
     override init(frame: NSRect) {
         super.init(frame: frame)
         addSubview(area)
         addSubview(sidebar)
+        sideBtn.isBordered = false
+        sideBtn.image = sym("sidebar.left", 15, .regular)
+        sideBtn.imagePosition = .imageOnly
+        sideBtn.contentTintColor = .secondaryLabelColor
+        sideBtn.toolTip = "Seitenleiste ein/aus (S)"
+        sideBtn.target = nil
+        sideBtn.action = #selector(AppDelegate.toggleSidebar)
+        addSubview(sideBtn)
     }
     required init?(coder: NSCoder) { fatalError() }
     override func layout() {
@@ -2077,6 +2166,9 @@ final class RootView: FlippedView {
         let sw: CGFloat = sidebarVisible ? 330 : 0
         sidebar.frame = NSRect(x: 0, y: 0, width: sw, height: bounds.height)
         area.frame = NSRect(x: sw, y: 0, width: bounds.width - sw, height: bounds.height)
+        sideBtn.frame = NSRect(x: 80, y: 9, width: 28, height: 24)
+        sideBtn.isHidden = window?.styleMask.contains(.fullScreen) ?? false
+        sideBtn.contentTintColor = sidebarVisible ? .secondaryLabelColor : .white
     }
 }
 
@@ -2089,7 +2181,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var timers: [Timer] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        log("launch")
+        rotateLog()
+        log("launch \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?")")
         buildMenu()
         WKContentRuleListStore.default().compileContentRuleList(forIdentifier: "streamed-adblock-v4", encodedContentRuleList: adRulesJSON()) { list, err in
             MainActor.assumeIsolated {
@@ -2139,6 +2232,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             win.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
         }
+        Badges.onLoad = { [weak self] in self?.root.sidebar.refreshMarks() }
         root.sidebar.load()
         log("window \(win.windowNumber)")
         win.makeFirstResponder(root.sidebar.table)
@@ -2149,6 +2243,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             MainActor.assumeIsolated { self?.root.sidebar.load() }
         })
         installMonitors()
+        installRecovery()
         Scores.shared.onChange = { [weak self] in
             guard let self else { return }
             self.root.sidebar.refreshMarks()
@@ -2194,6 +2289,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 t.toast("Hotel 1 · Main · 1080p\nBessere Qualität gefunden")
                 t.goal("TOR! \(t.match.home)", "\(t.match.home) 1:0 \(t.match.away)  ·  23'")
             }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 16) { [weak self] in self?.toggleSidebar() }
         }
         if args.contains("--goaltest") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
@@ -2269,6 +2365,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         win.subtitle = n == 0 ? "" : "\(n) Spiel\(n == 1 ? "" : "e")"
         root.sidebar.refreshMarks()
+    }
+
+    var netMon: NWPathMonitor?
+    var netWasDown = false
+    func installRecovery() {
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                log("wake from sleep – reload")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) { MainActor.assumeIsolated { self?.recover(all: true) } }
+            }
+        }
+        let m = NWPathMonitor()
+        m.pathUpdateHandler = { [weak self] path in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    if path.status != .satisfied { if !self.netWasDown { log("network down") }; self.netWasDown = true; return }
+                    if self.netWasDown {
+                        self.netWasDown = false
+                        log("network back – reload")
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { MainActor.assumeIsolated { self.recover(all: false) } }
+                    }
+                }
+            }
+        }
+        m.start(queue: DispatchQueue(label: "streamed.net"))
+        netMon = m
+    }
+    /// After sleep or a network drop: refresh the list and restart streams that are stuck.
+    func recover(all: Bool) {
+        root.sidebar.load()
+        for t in root.area.tiles where all || !t.started || t.freezeStart != 0 || t.current < 0 {
+            t.retryAt = [:]
+            t.reload()
+        }
     }
 
     func installMonitors() {
