@@ -1032,8 +1032,10 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
 
     var poolLimit: Int {
         guard auto, listReady, !streams.isEmpty else { return 0 }
-        if isActive { return Tile.POOL_MAX }
-        return started ? 0 : 4
+        // fewer background decoders when several games are open (MacBook Air throttles, bandwidth adds up)
+        let open = area?.tiles.count ?? 1
+        if isActive { return open <= 1 ? Tile.POOL_MAX : (open == 2 ? 3 : 2) }
+        return started ? 0 : (open >= 3 ? 2 : 4)
     }
 
     func spawnProbe(_ i: Int) {
