@@ -106,12 +106,33 @@ final class HUDButton: NSButton {
         image = sym(symbol, size) ?? NSImage()
         imagePosition = .imageOnly
         contentTintColor = .white
-        wantsLayer = true
-        layer?.backgroundColor = NSColor(white: 1, alpha: 0.16).cgColor
         toolTip = tip
+        setAccessibilityLabel(tip)   // icon-only button: VoiceOver needs a name
+        if #available(macOS 26.0, *) {
+            // Liquid Glass: transport controls over video are functional layer -> system glass bezel, circle shape
+            isBordered = true
+            bezelStyle = .glass
+            borderShape = .circle
+        } else {
+            wantsLayer = true
+            layer?.backgroundColor = NSColor(white: 1, alpha: 0.16).cgColor
+        }
     }
     required init?(coder: NSCoder) { fatalError() }
-    override func layout() { super.layout(); layer?.cornerRadius = bounds.height / 2 }
+    override func layout() {
+        super.layout()
+        if #unavailable(macOS 26.0) { layer?.cornerRadius = bounds.height / 2 }
+    }
+}
+/// Groups neighbouring glass controls so they sample the video together (NSGlassEffectContainerView on macOS 26).
+func glassGroup() -> (outer: NSView, content: NSView) {
+    let inner = FlippedView()
+    if #available(macOS 26.0, *) {
+        let c = NSGlassEffectContainerView()
+        c.contentView = inner
+        return (c, inner)
+    }
+    return (inner, inner)
 }
 /// Gradient so the controls stay readable on any video frame.
 final class GradientView: PassView {
@@ -126,12 +147,37 @@ final class GradientView: PassView {
     required init?(coder: NSCoder) { fatalError() }
     override func layout() { super.layout(); g.frame = bounds; g.startPoint = CGPoint(x: 0.5, y: 1); g.endPoint = CGPoint(x: 0.5, y: 0) }
 }
-func hud() -> NSVisualEffectView {
-    let v = NSVisualEffectView()
-    v.material = .hudWindow; v.blendingMode = .withinWindow; v.state = .active
-    v.wantsLayer = true; v.layer?.cornerRadius = 12; v.layer?.masksToBounds = true
-    return v
+/// Floating HUD panel (toasts, goal banner). macOS 26: regular Liquid Glass; earlier: .hudWindow material.
+final class HUDBox: NSView {
+    let content = FlippedView()
+    private var fx: NSView!
+    var radius: CGFloat = 12 { didSet { applyRadius() } }
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        if #available(macOS 26.0, *) {
+            let g = NSGlassEffectView()
+            g.style = .regular   // text-heavy -> regular, never clear
+            g.contentView = content
+            fx = g
+        } else {
+            let v = NSVisualEffectView()
+            v.material = .hudWindow; v.blendingMode = .withinWindow; v.state = .active
+            v.wantsLayer = true; v.layer?.masksToBounds = true
+            v.addSubview(content)
+            fx = v
+        }
+        addSubview(fx)
+        applyRadius()
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    private func applyRadius() {
+        if #available(macOS 26.0, *), let g = fx as? NSGlassEffectView { g.cornerRadius = radius } else { fx.layer?.cornerRadius = radius }
+    }
+    override func layout() { super.layout(); fx.frame = bounds; content.frame = bounds }
 }
+func hud() -> HUDBox { HUDBox(frame: .zero) }
+/// Weak reference that can be captured by @Sendable closures (only touched on the main actor).
+final class WeakRef<T: AnyObject>: @unchecked Sendable { weak var value: T?; init(_ v: T?) { value = v } }
 class PassView: FlippedView { override func hitTest(_ point: NSPoint) -> NSView? { nil } }
 
 // MARK: - Models / API
@@ -918,6 +964,7 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
 
     let bar = FlippedView()
     let barBG = GradientView()
+    let ctrl = glassGroup()
     let titleL = makeLabel(14, bold: true)
     let infoL = makeLabel(11, color: NSColor(white: 1, alpha: 0.72))
     let streamBtn = HUDButton("list.bullet", tip: "Streams wählen")
@@ -945,10 +992,11 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
         makeWeb()
 
         bar.addSubview(barBG)
+        bar.addSubview(ctrl.outer)
         for (b, a) in [(streamBtn, #selector(showMenu(_:))), (closeBtn, #selector(closeTapped)), (backBtn, #selector(backTapped)), (fwdBtn, #selector(fwdTapped)), (liveBtn, #selector(menuLive))] as [(NSButton, Selector)] {
             b.target = self
             b.action = a
-            bar.addSubview(b)
+            ctrl.content.addSubview(b)
         }
         titleL.textColor = .white
         let sh = NSShadow(); sh.shadowColor = NSColor(white: 0, alpha: 0.6); sh.shadowBlurRadius = 3; sh.shadowOffset = .zero
@@ -960,17 +1008,21 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
         toastL.font = .systemFont(ofSize: 13, weight: .medium)
         toastL.textColor = .white
         toastL.maximumNumberOfLines = 3
-        toastBox.addSubview(toastL)
+        toastBox.content.addSubview(toastL)
         toastBox.isHidden = true
         addSubview(toastBox)
 
-        goalBox.layer?.cornerRadius = 22
-        goalBox.layer?.borderWidth = 1
-        goalBox.layer?.borderColor = NSColor(white: 1, alpha: 0.12).cgColor
+        goalBox.radius = 22
+        if #unavailable(macOS 26.0) {   // glass draws its own edge; the hairline is only for the old material
+            goalBox.wantsLayer = true
+            goalBox.layer?.cornerRadius = 22
+            goalBox.layer?.borderWidth = 1
+            goalBox.layer?.borderColor = NSColor(white: 1, alpha: 0.12).cgColor
+        }
         goalL.alignment = .center
         goalL.textColor = .white
         goalL.maximumNumberOfLines = 3
-        goalBox.addSubview(goalL)
+        goalBox.content.addSubview(goalL)
         goalBox.isHidden = true
         addSubview(goalBox)
         border.wantsLayer = true
@@ -1186,6 +1238,7 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
         }
         bar.frame = NSRect(x: 0, y: 0, width: w, height: 72)
         barBG.frame = bar.bounds
+        ctrl.outer.frame = bar.bounds; ctrl.content.frame = bar.bounds
         let B: CGFloat = 28, y0: CGFloat = 12
         closeBtn.frame = NSRect(x: w - 12 - B, y: y0, width: B, height: B)
         streamBtn.frame = NSRect(x: closeBtn.frame.minX - 8 - B, y: y0, width: B, height: B)
@@ -1204,7 +1257,7 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
         s.width = min(maxW, ceil(s.width)); s.height = ceil(s.height)
         toastBox.frame = NSRect(x: (w - s.width - 32) / 2, y: h - s.height - 96, width: s.width + 32, height: s.height + 20)
         toastL.frame = NSRect(x: 16, y: 10, width: s.width, height: s.height)
-        toastBox.layer?.cornerRadius = min(14, toastBox.frame.height / 2)
+        toastBox.radius = min(14, toastBox.frame.height / 2)
         border.frame = bounds
         let gw = min(w - 40, 520), big: CGFloat = w < 500 ? 26 : 38
         goalL.font = .systemFont(ofSize: big, weight: .bold)
@@ -1225,7 +1278,7 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
         needsLayout = true
         goalTask?.cancel()
         goalTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 7_000_000_000)
+            try? await Task.sleep(for: .seconds(7))
             guard let self, !Task.isCancelled else { return }
             self.goalBox.isHidden = true
         }
@@ -1248,7 +1301,7 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
         barTask?.cancel()
         if ProcessInfo.processInfo.arguments.contains("--uitest") { return }
         barTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(sec * 1e9))
+            try? await Task.sleep(for: .seconds(sec))
             guard let self, !Task.isCancelled else { return }
             self.bar.animator().alphaValue = 0
             if self.window?.styleMask.contains(.fullScreen) == true { NSCursor.setHiddenUntilMouseMoves(true) }
@@ -1261,7 +1314,7 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
         needsLayout = true
         toastTask?.cancel()
         toastTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 4_500_000_000)
+            try? await Task.sleep(for: .seconds(4.5))
             guard let self, !Task.isCancelled else { return }
             self.toastBox.isHidden = true
         }
@@ -1307,12 +1360,11 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
         }
         let t0 = nowMs()
         Task { @MainActor [weak self] in
-            let rows = await fetchStreams(m, onFirst: { [weak self] part in
-                await MainActor.run {
-                    guard let self, self.openToken == token, !self.listReady, self.current < 0 else { return }
-                    log("[\(m.title)] early start: \(part.count) streams after \(Int(nowMs() - t0))ms")
-                    self.onStreamList(part)
-                }
+            let ref = WeakRef(self)   // immutable capture -> no captured-var warning (Swift 6 clean)
+            let rows = await fetchStreams(m, onFirst: { @MainActor part in
+                guard let self = ref.value, self.openToken == token, !self.listReady, self.current < 0 else { return }
+                log("[\(m.title)] early start: \(part.count) streams after \(Int(nowMs() - t0))ms")
+                self.onStreamList(part)
             })
             guard let self, self.openToken == token else { return }
             log("[\(m.title)] stream list: \(rows.count) streams after \(Int(nowMs() - t0))ms")
@@ -1842,6 +1894,9 @@ final class MatchCell: NSTableCellView {
         live.layer?.masksToBounds = true
         for b in [b1, b2] { b.imageScaling = .scaleProportionallyUpOrDown; b.wantsLayer = true; b.shadow = { let x = NSShadow(); x.shadowColor = NSColor(white: 0, alpha: 0.5); x.shadowBlurRadius = 2; return x }() }
         addSubview(iconBG); addSubview(icon); addSubview(b1); addSubview(b2); addSubview(t); addSubview(s); addSubview(r); addSubview(live)
+        for v in [icon, b1, b2, t, s, r, live] as [NSView] { v.setAccessibilityElement(false) }
+        setAccessibilityElement(true)
+        setAccessibilityRole(.cell)
     }
     required init?(coder: NSCoder) { fatalError() }
     override func layout() {
@@ -1880,12 +1935,29 @@ final class MatchCell: NSTableCellView {
             r.stringValue = "\(sc.h):\(sc.a) · \(sc.clock)"
             r.textColor = sc.state == "in" ? .labelColor : .secondaryLabelColor
         }
+        // same info VoiceOver reads as is shown (no extra spoilers: open games never show a score)
+        setAccessibilityLabel([m.title, s.stringValue, live.isHidden ? nil : "Live", open ? "läuft" : nil, r.stringValue].compactMap { $0 }.joined(separator: ", "))
         needsLayout = true
     }
 }
 
+/// macOS 26: the sidebar floats as Liquid Glass, inset from the window edge (like Finder/Music on Tahoe).
+let GLASS_SIDEBAR: Bool = { if #available(macOS 26.0, *) { return true }; return false }()
+let SIDE_INSET: CGFloat = GLASS_SIDEBAR ? 8 : 0
+let SIDE_RADIUS: CGFloat = 18
+/// Glass sidebar starts below the title-bar row (traffic lights + sidebar button stay on the window background).
+let SIDE_TOP: CGFloat = GLASS_SIDEBAR ? 38 : 0
+let SIDE_SHIFT: CGFloat = GLASS_SIDEBAR ? -30 : 0   // content moves up by the part of the title bar it no longer spans
+
 final class Sidebar: FlippedView, NSTableViewDataSource, NSTableViewDelegate {
-    let fx = NSVisualEffectView()
+    let fx: NSView = {
+        if #available(macOS 26.0, *) {
+            let g = NSGlassEffectView(); g.style = .regular; g.cornerRadius = SIDE_RADIUS
+            return g
+        }
+        let v = NSVisualEffectView(); v.material = .sidebar; v.blendingMode = .behindWindow; v.state = .followsWindowActiveState
+        return v
+    }()
     let sep = NSBox()
     let partyCard = NSView()
     let partyIcon = NSImageView()
@@ -1954,11 +2026,9 @@ final class Sidebar: FlippedView, NSTableViewDataSource, NSTableViewDelegate {
 
     override init(frame: NSRect) {
         super.init(frame: frame)
-        fx.material = .sidebar
-        fx.blendingMode = .behindWindow
-        fx.state = .followsWindowActiveState
         addSubview(fx)
         sep.boxType = .separator
+        sep.isHidden = GLASS_SIDEBAR   // floating glass has its own edge
         addSubview(sep)
         logo.stringValue = "Streamed"
         logo.font = .systemFont(ofSize: 22, weight: .bold)
@@ -1966,7 +2036,7 @@ final class Sidebar: FlippedView, NSTableViewDataSource, NSTableViewDelegate {
         header.font = .systemFont(ofSize: 11, weight: .semibold)
         header.textColor = .tertiaryLabelColor
         partyCard.wantsLayer = true
-        partyCard.layer?.cornerRadius = 12
+        partyCard.layer?.cornerRadius = GLASS_SIDEBAR ? SIDE_RADIUS - 10 : 12   // concentric: parent radius − inset
         partyCard.layer?.backgroundColor = NSColor(white: 1, alpha: 0.06).cgColor
         partyCard.layer?.borderWidth = 0.5
         partyCard.layer?.borderColor = NSColor(white: 1, alpha: 0.08).cgColor
@@ -1979,6 +2049,7 @@ final class Sidebar: FlippedView, NSTableViewDataSource, NSTableViewDelegate {
         keysBtn.imageHugsTitle = true
         keysBtn.attributedTitle = NSAttributedString(string: " Tastenkürzel", attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor])
         keysBtn.contentTintColor = .secondaryLabelColor
+        keysBtn.setAccessibilityLabel("Tastenkürzel anzeigen")
         keysBtn.target = self
         keysBtn.action = #selector(showKeys(_:))
         addSubview(keysBtn)
@@ -2033,6 +2104,7 @@ final class Sidebar: FlippedView, NSTableViewDataSource, NSTableViewDelegate {
         multiBtn.target = self
         multiBtn.action = #selector(multiTapped)
         multiBtn.toolTip = "Multistream: mehrere Spiele gleichzeitig (⇧⌘N)"
+        multiBtn.setAccessibilityLabel("Multistream")
         for v in [logo, multiBtn, tabs, search, header, scroll, partyTitle, partyStatus, partyStart, partyJoin, partyCopy, partyLeave, chatField] as [NSView] { addSubview(v) }
         emojiBtns.forEach { addSubview($0) }
         updateParty()
@@ -2045,11 +2117,13 @@ final class Sidebar: FlippedView, NSTableViewDataSource, NSTableViewDelegate {
         fx.frame = bounds
         sep.frame = NSRect(x: W - 1, y: 0, width: 1, height: H)
         let cw = W - 1   // content width without the separator
-        multiBtn.frame = NSRect(x: cw - P - 28, y: 9, width: 28, height: 24)   // in the title bar, next to the traffic lights
-        logo.frame = NSRect(x: P, y: 44, width: cw - 2 * P, height: 30)
-        tabs.frame = NSRect(x: P, y: 82, width: cw - 2 * P, height: 24)
-        search.frame = NSRect(x: P, y: 116, width: cw - 2 * P, height: 26)
-        header.frame = NSRect(x: P + 2, y: 152, width: cw - 2 * P, height: 15)
+        let d = SIDE_SHIFT
+        // classic: in the title bar next to the traffic lights; glass: on the logo row inside the sidebar
+        multiBtn.frame = GLASS_SIDEBAR ? NSRect(x: cw - P - 28, y: 47 + d, width: 28, height: 24) : NSRect(x: cw - P - 28, y: 9, width: 28, height: 24)
+        logo.frame = NSRect(x: P, y: 44 + d, width: cw - 2 * P - 34, height: 30)
+        tabs.frame = NSRect(x: P, y: 82 + d, width: cw - 2 * P, height: 24)
+        search.frame = NSRect(x: P, y: 116 + d, width: cw - 2 * P, height: 26)
+        header.frame = NSRect(x: P + 2, y: 152 + d, width: cw - 2 * P, height: 15)
         let on = Party.shared.active
         let keysH: CGFloat = 30
         let partyH: CGFloat = on ? 172 : 104
@@ -2068,7 +2142,7 @@ final class Sidebar: FlippedView, NSTableViewDataSource, NSTableViewDelegate {
         chatField.frame = NSRect(x: ix, y: by + 34, width: iw, height: 24)
         let ew = (iw - 4 * 6) / 5
         for (i, b) in emojiBtns.enumerated() { b.frame = NSRect(x: ix + CGFloat(i) * (ew + 6), y: by + 64, width: ew, height: 28) }
-        scroll.frame = NSRect(x: 0, y: 172, width: cw, height: max(0, py - 172 - 8))
+        scroll.frame = NSRect(x: 0, y: 172 + d, width: cw, height: max(0, py - 172 - d - 8))
         keysBtn.frame = NSRect(x: P - 2, y: H - keysH - 4, width: 120, height: keysH)
         table.tableColumns.first?.width = max(50, scroll.contentSize.width - 28)
     }
@@ -2158,6 +2232,7 @@ final class RootView: FlippedView {
         sideBtn.imagePosition = .imageOnly
         sideBtn.contentTintColor = .secondaryLabelColor
         sideBtn.toolTip = "Seitenleiste ein/aus (S)"
+        sideBtn.setAccessibilityLabel("Seitenleiste ein- oder ausblenden")
         sideBtn.target = nil
         sideBtn.action = #selector(AppDelegate.toggleSidebar)
         addSubview(sideBtn)
@@ -2166,7 +2241,9 @@ final class RootView: FlippedView {
     override func layout() {
         super.layout()
         let sw: CGFloat = sidebarVisible ? 330 : 0
-        sidebar.frame = NSRect(x: 0, y: 0, width: sw, height: bounds.height)
+        let i = sidebarVisible ? SIDE_INSET : 0
+        let top = sidebarVisible ? SIDE_TOP : 0
+        sidebar.frame = NSRect(x: i, y: top, width: max(0, sw - 2 * i), height: bounds.height - top - i)
         area.frame = NSRect(x: sw, y: 0, width: bounds.width - sw, height: bounds.height)
         sideBtn.frame = NSRect(x: 80, y: 9, width: 28, height: 24)
         sideBtn.isHidden = window?.styleMask.contains(.fullScreen) ?? false
@@ -2209,6 +2286,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         win.collectionBehavior = [.fullScreenPrimary]
         win.backgroundColor = .black
         win.isReleasedWhenClosed = false
+
         root = RootView(frame: win.contentView!.bounds)
         win.contentView = root
         win.delegate = self
