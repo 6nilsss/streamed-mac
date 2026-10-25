@@ -70,6 +70,24 @@ func catName(_ c: String) -> String {
 }
 func srcOf(_ title: String) -> String { String(title.split(separator: " ").first ?? "").lowercased() }
 func score(_ src: String) -> Float { UD.float(forKey: "score:" + src) }
+/// Start statistics per source (decaying counts). A source that keeps failing to start and never plays is "broken":
+/// it goes last and is left out of the background pool; one retry every 6 h in case it works again.
+enum Health {
+    static func ok(_ src: String) { bump(src, ok: 1, bad: 0) }
+    static func bad(_ src: String) { bump(src, ok: 0, bad: 1) }
+    static func bump(_ src: String, ok: Float, bad: Float) {
+        let o = UD.float(forKey: "q_ok:" + src) * 0.97 + ok, b = UD.float(forKey: "q_bad:" + src) * 0.97 + bad
+        UD.set(o, forKey: "q_ok:" + src); UD.set(b, forKey: "q_bad:" + src)
+        if bad > 0 && isBroken(src) && b - 1 < 6 { log("Quelle \(src) gilt jetzt als kaputt (\(Int(b)) Fehlstarts, kein Erfolg)") }
+    }
+    static func isBroken(_ src: String) -> Bool { UD.float(forKey: "q_bad:" + src) >= 6 && UD.float(forKey: "q_ok:" + src) < 0.5 }
+    /// broken but due for a retry?
+    static func mayRetry(_ src: String) -> Bool {
+        let last = UD.double(forKey: "q_try:" + src)
+        return Date().timeIntervalSince1970 - last > 6 * 3600
+    }
+    static func tried(_ src: String) { UD.set(Date().timeIntervalSince1970, forKey: "q_try:" + src) }
+}
 
 func makeLabel(_ size: CGFloat, bold: Bool = false, color: NSColor = C_TEXT) -> NSTextField {
     let l = NSTextField(labelWithString: "")
@@ -211,6 +229,58 @@ struct Match {
 
 struct StreamInfo { let url: String; let title: String; let hd: Bool }
 
+/// Some sources (golf) only wrap another player page in two iframes (embed.st -> rockyembed.st -> embed.st/embed/ingest/…).
+/// Our monitor only sees the main frame, so those never "started". Resolve to the real player page and load that directly.
+actor EmbedResolver {
+    static let shared = EmbedResolver()
+    var cache: [String: String] = [:]
+    func resolve(_ url: String) async -> String {
+        if let c = cache[url] { return c }
+        let out = await EmbedResolver.unwrap(url) ?? url
+        cache[url] = out
+        return out
+    }
+    static func get(_ url: String, referer: String) async -> String? {
+        guard let u = URL(string: url) else { return nil }
+        var r = URLRequest(url: u, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 4)
+        r.setValue(UA, forHTTPHeaderField: "User-Agent")
+        r.setValue(referer, forHTTPHeaderField: "Referer")
+        guard let (d, _) = try? await URLSession.shared.data(for: r) else { return nil }
+        return String(decoding: d, as: UTF8.self)
+    }
+    static func first(_ pattern: String, in text: String) -> String? {
+        guard let re = try? NSRegularExpression(pattern: pattern),
+              let m = re.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)), m.numberOfRanges > 1,
+              let r = Range(m.range(at: 1), in: text) else { return nil }
+        return String(text[r])
+    }
+    static func unwrap(_ url: String) async -> String? {
+        let t0 = nowMs()
+        guard let page = await get(url, referer: "https://streamed.pk/"),
+              let inner = first(#"<iframe src="(https://[^"]+\.php[^"]*)""#, in: page)?.replacingOccurrences(of: "&amp;", with: "&"),
+              let page2 = await get(inner, referer: url),
+              let b64 = first(#"atob\("([A-Za-z0-9+/=]+)"\)"#, in: page2),
+              let d = Data(base64Encoded: b64), let final = String(data: d, encoding: .utf8), final.hasPrefix("https://") else {
+            log("resolve \(url) -> nichts gefunden (\(Int(nowMs() - t0))ms)")
+            return nil
+        }
+        log("resolve \(url) -> \(final) (\(Int(nowMs() - t0))ms)")
+        return final
+    }
+}
+let NESTED_SOURCES: Set<String> = ["golf"]
+/// Start timeouts (were 25 s / 20 s). Log 20.–25.10.: working streams start after 3.4 s median, 95 % < 7.3 s, 99 % < 15.4 s.
+let LATENCY_LOG = ProcessInfo.processInfo.arguments.contains("--latency")
+let VISIBLE_START_MS = 14000.0, PROBE_START_MS = 15000.0
+/// Extra distance behind the live edge (hls.js liveSyncDuration), 0 = player default.
+/// Measured 25.10.: default already plays ~17 s behind live; asking for 28 s only reached ~21 s (playlist window is short),
+/// so a bigger value would park playback at the oldest segment (risky). Kept at 0, switchable via --delay N for tests.
+let LIVE_DELAY: Double = {
+    let a = ProcessInfo.processInfo.arguments
+    if let i = a.firstIndex(of: "--delay"), i + 1 < a.count, let d = Double(a[i + 1]) { return d }
+    return 0
+}()
+
 func getJSON(_ path: String, timeout: TimeInterval = 10) async -> Any? {
     guard let url = URL(string: API + path) else { return nil }
     var r = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: timeout)
@@ -237,13 +307,20 @@ func fetchStreams(_ m: Match, onFirst: (@Sendable ([StreamInfo]) async -> Void)?
         for (source, id) in srcs {
             g.addTask {
                 guard let arr = await getJSON("/stream/\(source)/\(id)", timeout: 6) as? [[String: Any]] else { return [] }
-                return arr.compactMap { x -> StreamInfo? in
+                let list = arr.compactMap { x -> StreamInfo? in
                     let url = str(x["embedUrl"])
                     if url.isEmpty { return nil }
                     let s = str(x["source"]).isEmpty ? source : str(x["source"])
                     let lang = str(x["language"])
                     let title = cap(s) + " " + str(x["streamNo"]) + (lang.isEmpty ? "" : " · " + lang)
                     return StreamInfo(url: url, title: title, hd: (x["hd"] as? NSNumber)?.boolValue ?? false)
+                }
+                guard NESTED_SOURCES.contains(source.lowercased()) else { return list }
+                return await withTaskGroup(of: (Int, String).self) { rg -> [StreamInfo] in
+                    for (i, x) in list.enumerated() { rg.addTask { (i, await EmbedResolver.shared.resolve(x.url)) } }
+                    var urls = list.map { $0.url }
+                    for await (i, u) in rg { urls[i] = u }
+                    return list.enumerated().map { StreamInfo(url: urls[$0.offset], title: $0.element.title, hd: $0.element.hd) }
                 }
             }
         }
@@ -587,7 +664,7 @@ var ruleList: WKContentRuleList?
 
 // MARK: - Injected JS
 
-let SHIM = #"""
+let SHIM = "window.__liveDelay=\(LIVE_DELAY);\n" + #"""
 (function(){
 try{performance.setResourceTimingBufferSize(5000)}catch(e){}
 try{['MediaSource','ManagedMediaSource','WebKitMediaSource'].forEach(function(n){var M=window[n];if(M&&M.prototype&&M.prototype.setLiveSeekableRange){M.prototype.setLiveSeekableRange=function(){};M.prototype.clearLiveSeekableRange=function(){};}})}catch(e){}
@@ -596,7 +673,7 @@ var f=function(){return {closed:false,close:function(){},focus:function(){},blur
 try{window.open=function(){return f();};}catch(e){}
 try{var fe={destroy:function(){},on:function(){},off:function(){}};Object.defineProperty(window,'__wasm_jw_engine',{get:function(){return fe;},set:function(){},configurable:false});}catch(e){}
 try{var _jw;Object.defineProperty(window,'jwplayer',{configurable:true,get:function(){return _jw},set:function(f){if(typeof f!=='function'||f.__w){_jw=f;return}
-var w=function(){var p=f.apply(this,arguments);if(p&&p.setup&&!p.__ws){var o=p.setup;p.setup=function(c){try{if(c&&typeof c==='object'){c.safarihlsjs=true;c.hlsjsdefault=true;c.hlsjsConfig=Object.assign({},c.hlsjsConfig||{},{backBufferLength:90,maxBufferLength:30});try{delete c.hlsjsConfig.p2pConfig}catch(e){}}}catch(e){}return o.apply(this,arguments)};p.__ws=1}return p};
+var w=function(){var p=f.apply(this,arguments);if(p&&p.setup&&!p.__ws){var o=p.setup;p.setup=function(c){try{if(c&&typeof c==='object'){c.safarihlsjs=true;c.hlsjsdefault=true;c.hlsjsConfig=Object.assign({},c.hlsjsConfig||{},{backBufferLength:90,maxBufferLength:30});if(window.__liveDelay>0){delete c.hlsjsConfig.liveSyncDurationCount;delete c.hlsjsConfig.liveMaxLatencyDurationCount;delete c.hlsjsConfig.liveMaxLatencyDuration;c.hlsjsConfig.liveSyncDuration=window.__liveDelay;c.liveSyncDuration=window.__liveDelay}try{delete c.hlsjsConfig.p2pConfig}catch(e){}}}catch(e){}return o.apply(this,arguments)};p.__ws=1}return p};
 for(var k in f){try{w[k]=f[k]}catch(e){}}w.__w=1;_jw=w}})}catch(e){}
 if(window.__mute===undefined)window.__mute=true;
 var n=0,iv=setInterval(function(){n++;if(n>150){clearInterval(iv);return;}
@@ -615,6 +692,17 @@ try{Object.defineProperty(document,'fullscreenEnabled',{get:function(){return tr
 })();
 """#
 
+/// Video element events from the page (waiting/stalled/error/playing) -> check the visible stream right away.
+final class EvProxy: NSObject, WKScriptMessageHandler {
+    weak var tile: Tile?
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        MainActor.assumeIsolated {
+            guard let t = tile, let w = message.webView, w === t.web else { return }   // pool streams are ignored here
+            t.onVideoEvent(message.body as? String ?? "")
+        }
+    }
+}
+
 final class FSProxy: NSObject, WKScriptMessageHandler {
     weak var tile: Tile?
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
@@ -631,6 +719,7 @@ var m=0;try{m=performance.getEntriesByType('resource').some(function(e){return e
 var v=document.querySelector('.jw-media video')||document.querySelector('video');
 if(!v)return JSON.stringify({v:0,bad:bad,ads:ads,m:m});
 try{var be=0;if(v.buffered&&v.buffered.length)be=v.buffered.end(v.buffered.length-1);if(v.seekable&&v.seekable.length)be=Math.max(be,v.seekable.end(v.seekable.length-1));if(be>0&&isFinite(be)){var off=be-performance.now()/1000;if(window.__edge===undefined||off>window.__edge)window.__edge=off}}catch(e){}
+if(!v.__ev){v.__ev=1;['waiting','stalled','error','playing'].forEach(function(n){v.addEventListener(n,function(){try{window.webkit.messageHandlers.ev.postMessage(n)}catch(e){}})})}
 var mute=!!window.__mute;if(v.muted!==mute){v.muted=mute;try{jwplayer().setMute(mute)}catch(e){}}
 if(v.paused&&!window.__userPaused&&!ads){try{jwplayer().play()}catch(e){v.play()}}
 return JSON.stringify({v:1,bad:bad,ads:ads,m:m,t:v.currentTime,p:v.paused,h:v.videoHeight,err:!!v.error});})()
@@ -1050,6 +1139,8 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
         cfg.userContentController.addUserScript(WKUserScript(source: FS_HOOK, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         let fp = FSProxy(); fp.tile = self
         cfg.userContentController.add(fp, name: "fs")
+        let ev = EvProxy(); ev.tile = self
+        cfg.userContentController.add(ev, name: "ev")
         let w = WKWebView(frame: bounds, configuration: cfg)
         w.customUserAgent = UA
         w.navigationDelegate = self
@@ -1125,6 +1216,8 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
         for i in streams.indices where probes.count < limit {
             let u = streams[i].url
             if have.contains(u) || (retryAt[u] ?? 0) > now { continue }
+            let src = srcOf(streams[i].title)
+            if Health.isBroken(src) { if Health.mayRetry(src) { Health.tried(src) } else { continue } }
             spawnProbe(i); have.insert(u); added.append(streams[i].title)
         }
         if !added.isEmpty { log("[\(match.title)] pool + \(added) (\(probes.count) im Hintergrund)") }
@@ -1142,7 +1235,7 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
                 if (o["ads"] as? NSNumber)?.boolValue == true { p.lastProgress = now; p.goodSince = 0; return }
                 if v == 1 && h > 0 {
                     if p.lastT >= 0 && t > p.lastT + 0.05 {
-                        if p.startedAt == 0 { p.startedAt = now; log("[\(self.match.title)] pool \(self.ptitle(p)) \(h)p nach \(Int(now - p.start))ms") }
+                        if p.startedAt == 0 { p.startedAt = now; Health.ok(srcOf(self.ptitle(p))); log("[\(self.match.title)] pool \(self.ptitle(p)) \(h)p nach \(Int(now - p.start))ms") }
                         if p.goodSince == 0 { p.goodSince = now }
                         p.h = h
                         p.lastProgress = now
@@ -1154,7 +1247,7 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
                     p.lastT = t
                 }
             }
-            if p.startedAt == 0 && now - p.start > 20000 { p.dead = true }
+            if p.startedAt == 0 && now - p.start > PROBE_START_MS { p.dead = true; Health.bad(srcOf(ptitle(p))) }
             if p.startedAt > 0 && now - p.lastProgress > 10000 { p.dead = true; log("[\(match.title)] pool \(ptitle(p)) hängt – später nochmal") }
         }
         decideProbes()
@@ -1389,6 +1482,7 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
             v += sc > 0 ? hg / 10 : 0
             v += sc * 5
             v += r.hd ? 3 : 0
+            if Health.isBroken(src) { v -= 500 }
             v -= Float(i) * 0.01
             rank.append(v)
         }
@@ -1462,10 +1556,11 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
     func nextCandidate(from: Int) -> Int {
         let n = streams.count
         if n == 0 { return -1 }
-        for pass in 0..<2 {
+        for pass in 0..<3 {
             for k in 1...n {
                 let i = ((from + k) % n + n) % n
                 if i == from || failed[i] { continue }
+                if pass < 2 && Health.isBroken(srcOf(streams[i].title)) { continue }
                 if pass == 0 && !streams[i].hd { continue }
                 return i
             }
@@ -1477,6 +1572,7 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
         guard current >= 0, current < streams.count else { return }
         let src = srcOf(streams[current].title)
         UD.set(score(src) * 0.8 - 1, forKey: "score:" + src)
+        if !started { Health.bad(src) }
         if streams[current].url == UD.string(forKey: "last:" + match.title) { UD.removeObject(forKey: "last:" + match.title) }
         failed[current] = true
         log("[\(match.title)] fail \(streams[current].title): \(reason)")
@@ -1527,6 +1623,7 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
         let src = srcOf(streams[current].title)
         let bonus: Float = h >= 1080 ? 1 : (h >= 720 ? 0.5 : 0)
         UD.set(score(src) * 0.8 + 1 + bonus, forKey: "score:" + src)
+        Health.ok(src)
         UD.set(h, forKey: "h:" + src)
         UD.set(streams[current].url, forKey: "last:" + match.title)
         UD.set(streams[current].title, forKey: "lastTitle:" + match.title)
@@ -1550,7 +1647,24 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
             return
         }
         maintainPool()
-        if !probes.isEmpty { pollProbes() }
+        pollTick += 1
+        if !probes.isEmpty { if pollTick % 2 == 0 || !started { pollProbes() } else { decideProbes() } }
+        pollCurrent()
+        if LATENCY_LOG && started && pollTick % 30 == 0 {
+            let title = match.title
+            web.evaluateJavaScript(STATE_JS) { r, _ in log("[\(title)] latency \(r as? String ?? "?")") }
+        }
+    }
+    var pollTick = 0
+    var lastEventPoll = 0.0
+    func onVideoEvent(_ name: String) {
+        let now = nowMs()
+        guard now - lastEventPoll > 250 else { return }
+        lastEventPoll = now
+        if name != "playing" && started { log("[\(match.title)] video event: \(name)") }
+        pollCurrent()
+    }
+    func pollCurrent() {
         guard current >= 0 else { return }
         let cur = current
         web.evaluateJavaScript("window.__mute=\(muted);" + MONITOR) { [weak self] r, _ in
@@ -1585,7 +1699,7 @@ final class Tile: FlippedView, WKNavigationDelegate, WKUIDelegate {
                 lastT = t
             }
             if !manifestSeen && el > 12000 { fail("Keine Antwort"); return }
-            if el > 25000 { fail("Startet nicht") }
+            if el > VISIBLE_START_MS { fail("Startet nicht") }
             return
         }
         if v == 0 { return }
